@@ -3,6 +3,7 @@
 package config
 
 import (
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/soroworks/sorovault/internal/attest"
 	"go.yaml.in/yaml/v3"
 )
 
@@ -25,31 +27,19 @@ const (
 	DefaultRPCTimeout         = 30 * time.Second
 	DefaultRateLimitPerMinute = 30
 	DefaultRateLimitBurst     = 10
+
+	// DefaultRefreshEventsInterval is how often the event follower asks the
+	// RPC for new upgrade events when REFRESH_EVENTS is on. The network
+	// closes a ledger about every five seconds.
+	DefaultRefreshEventsInterval = 10 * time.Second
+	MinDatabaseMaxConns          = 1
+	MaxDatabaseConns             = 10000
 )
 
 // Log format names accepted by LOG_FORMAT.
 const (
 	LogFormatText = "text"
 	LogFormatJSON = "json"
-)
-
-// Bounds on the connection pool sizes accepted from the environment.
-//
-// The sizes themselves default to zero, which means "not configured": pgx
-// picks its own default, the greater of 4 or the number of CPUs for the
-// maximum and none for the minimum. That default is deliberately not spelled
-// out here, because pgx derives it from the machine the process runs on and
-// a copy frozen into this file would be right for one host and wrong for
-// another.
-const (
-	// MinDatabaseMaxConns is the smallest maximum accepted: a pool of
-	// zero connections could not serve a request.
-	MinDatabaseMaxConns = 1
-	// MaxDatabaseConns is the largest size accepted, for the maximum or
-	// the minimum. A registry serving a busy API does not need a pool of
-	// tens of thousands of connections, so a value this large is nearly
-	// always a typo.
-	MaxDatabaseConns = 10000
 )
 
 // Config is the resolved runtime configuration.
@@ -94,6 +84,23 @@ type Config struct {
 	// RefreshWebhookSecret, when set, signs webhook payloads with
 	// HMAC-SHA256 so a receiver can tell them from anyone else's.
 	RefreshWebhookSecret string
+	// RefreshEvents makes `serve` follow the network's contract-upgrade
+	// events and refresh a contract as soon as it is upgraded, instead of
+	// waiting for the next polling sweep. Polling (REFRESH_INTERVAL) keeps
+	// running as a safety net, so it must be set too.
+	RefreshEvents bool
+	// RefreshEventsInterval is how often new upgrade events are read.
+	RefreshEventsInterval time.Duration
+
+	// Signer, when set, signs every interface response. It is built from
+	// SIGNING_KEY (or SIGNING_KEY_FILE): a base64 32-byte Ed25519 seed.
+	// `sorovault keygen` makes one.
+	Signer *attest.Signer
+	// RetiredSigningKeys are earlier public keys (SIGNING_RETIRED_KEYS,
+	// comma-separated base64) that stay published at GET /api/keys so
+	// signatures made before a rotation can still be verified.
+	RetiredSigningKeys []ed25519.PublicKey
+
 	// CORSOrigins are the exact browser origins allowed to call the API.
 	// "*" allows every origin for read-only requests only. Empty disables
 	// CORS headers, as the server has always behaved.
@@ -160,6 +167,11 @@ func ParseAPITokens(raw string) ([]string, error) {
 	return tokens, nil
 }
 
+// MinRefreshEventsInterval is the shortest REFRESH_EVENTS_INTERVAL accepted,
+// so the follower cannot hammer the RPC faster than the network closes
+// ledgers.
+const MinRefreshEventsInterval = 2 * time.Second
+
 // MinRefreshInterval is the shortest REFRESH_INTERVAL accepted. Below it a
 // sweep over a large registry could still be running when the next is due,
 // and a public RPC endpoint would see it as abuse.
@@ -206,6 +218,11 @@ var knownConfigKeys = map[string]bool{
 	"refresh_interval":             true,
 	"refresh_webhook_url":          true,
 	"refresh_webhook_secret":       true,
+	"refresh_events":               true,
+	"refresh_events_interval":      true,
+	"signing_key":                  true,
+	"signing_key_file":             true,
+	"signing_retired_keys":         true,
 	"cors_origins":                 true,
 	"rate_limit_per_minute":        true,
 	"rate_limit_burst":             true,
@@ -425,6 +442,13 @@ func LoadWith(configPath string) (*Config, error) {
 		}
 	}
 
+	if err := loadEvents(cfg, src); err != nil {
+		return nil, err
+	}
+	if err := loadSigning(cfg, src); err != nil {
+		return nil, err
+	}
+
 	if cfg.DatabaseURL == "" {
 		return nil, errors.New("config: DATABASE_URL or DATABASE_URL_FILE is required")
 	}
@@ -433,6 +457,85 @@ func LoadWith(configPath string) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// loadEvents reads the event-driven refresh settings.
+func loadEvents(cfg *Config, src *source) error {
+	cfg.RefreshEventsInterval = DefaultRefreshEventsInterval
+
+	if raw := strings.TrimSpace(src.Getenv("REFRESH_EVENTS")); raw != "" {
+		on, err := strconv.ParseBool(raw)
+		if err != nil {
+			return fmt.Errorf("config: REFRESH_EVENTS %q: want true or false", raw)
+		}
+		cfg.RefreshEvents = on
+	}
+
+	if raw := src.Getenv("REFRESH_EVENTS_INTERVAL"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return fmt.Errorf("config: REFRESH_EVENTS_INTERVAL %q: %w", raw, err)
+		}
+		if d < MinRefreshEventsInterval {
+			return fmt.Errorf("config: REFRESH_EVENTS_INTERVAL must be at least %s, got %s",
+				MinRefreshEventsInterval, d)
+		}
+		cfg.RefreshEventsInterval = d
+	}
+
+	if cfg.RefreshEvents && cfg.RefreshInterval <= 0 {
+		return errors.New("config: REFRESH_EVENTS needs REFRESH_INTERVAL as well; " +
+			"polling stays on as the safety net behind the events")
+	}
+	return nil
+}
+
+// loadSigning reads the interface-signing key and the retired public keys.
+//
+// Like the database URL, the signing key can come from a file
+// (SIGNING_KEY_FILE) so it never has to enter the environment.
+func loadSigning(cfg *Config, src *source) error {
+	inline := strings.TrimSpace(src.Getenv("SIGNING_KEY"))
+	path := src.Getenv("SIGNING_KEY_FILE")
+	if inline != "" && path != "" {
+		return errors.New("config: set either SIGNING_KEY or SIGNING_KEY_FILE, not both")
+	}
+	if path != "" {
+		b, err := os.ReadFile(path) //nolint:gosec // path is an operator-provided secret file setting
+		if err != nil {
+			return fmt.Errorf("config: SIGNING_KEY_FILE: %w", err)
+		}
+		inline = strings.TrimSpace(string(b))
+	}
+
+	if inline != "" {
+		// The error never includes the key.
+		seed, err := attest.ParseSeed(inline)
+		if err != nil {
+			return errors.New("config: SIGNING_KEY is not valid base64")
+		}
+		signer, err := attest.NewSigner(seed)
+		if err != nil {
+			return fmt.Errorf("config: SIGNING_KEY: %w", err)
+		}
+		cfg.Signer = signer
+	}
+
+	for _, raw := range strings.Split(src.Getenv("SIGNING_RETIRED_KEYS"), ",") {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		pub, err := attest.ParsePublicKey(raw)
+		if err != nil {
+			return fmt.Errorf("config: SIGNING_RETIRED_KEYS: %w", err)
+		}
+		cfg.RetiredSigningKeys = append(cfg.RetiredSigningKeys, pub)
+	}
+	if len(cfg.RetiredSigningKeys) > 0 && cfg.Signer == nil {
+		return errors.New("config: SIGNING_RETIRED_KEYS is set but there is no SIGNING_KEY")
+	}
+	return nil
 }
 
 // checkWebhookURL rejects a webhook address that could never be delivered

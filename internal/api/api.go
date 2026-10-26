@@ -10,6 +10,7 @@ package api
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/subtle"
 	_ "embed"
@@ -30,6 +31,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/soroworks/sorovault/internal/attest"
 	"github.com/soroworks/sorovault/internal/codegen"
 	"github.com/soroworks/sorovault/internal/model"
 	"github.com/soroworks/sorovault/internal/refresher"
@@ -51,6 +53,11 @@ type Server struct {
 	// sweep. It is nil when refresh is disabled, and GET /api/stats then
 	// omits the field.
 	lastSweep func() (refresher.SweepRecord, bool)
+
+	// signer, when set, signs interface responses. keys is every public key
+	// published at GET /api/keys: the signer's, then any retired ones.
+	signer *attest.Signer
+	keys   []attest.Key
 
 	// readOnly marks a mirror that refuses writes. It is read once, when
 	// Routes mounts, so a server's mode is fixed at startup.
@@ -95,6 +102,24 @@ func (s *Server) SetLastSweep(fn func() (refresher.SweepRecord, bool)) {
 	s.lastSweep = fn
 }
 
+// SetSigner makes the server attach a detached Ed25519 signature to every
+// interface response, and publish the verification keys at GET /api/keys.
+// retired are earlier public keys that stay published so signatures made
+// before a rotation remain verifiable.
+func (s *Server) SetSigner(signer *attest.Signer, retired ...ed25519.PublicKey) {
+	s.signer = signer
+	s.keys = nil
+	if signer == nil {
+		return
+	}
+	s.keys = append(s.keys, attest.NewKey(signer.PublicKey(), true))
+	for _, pub := range retired {
+		if key := attest.NewKey(pub, false); key.ID != s.keys[0].ID {
+			s.keys = append(s.keys, key)
+		}
+	}
+}
+
 // Routes returns the API's routes, to be mounted under /api.
 func (s *Server) Routes() chi.Router {
 	r := chi.NewRouter()
@@ -111,6 +136,7 @@ func (s *Server) Routes() chi.Router {
 	r.Get("/wasm/{hash}/contracts", s.listWasmContracts)
 	r.Get("/contracts/{id}", s.getContract)
 	r.Put("/contracts/{id}/source", s.write(s.updateContractSource))
+	r.Post("/contracts/{id}/verify", s.write(s.verifyPublisher))
 	r.Put("/contracts/{id}/deprecation", s.write(s.setContractDeprecation))
 	r.Delete("/contracts/{id}/deprecation", s.write(s.clearContractDeprecation))
 	r.Post("/contracts/{id}/refresh", s.write(s.rateLimited(s.refreshContract)))
@@ -121,6 +147,7 @@ func (s *Server) Routes() chi.Router {
 	r.Get("/contracts/{id}/functions/{fn}/schema.json", s.getFunctionSchema)
 	r.Get("/contracts/{id}/functions/{fn}/example.json", s.getFunctionExample)
 	r.Get("/contracts/{id}/client.ts", s.getTypeScriptClient)
+	r.Get("/keys", s.getKeys)
 	r.Get("/stats", s.getStats)
 	r.Get("/upgrades", s.listUpgrades)
 	r.Get("/upgrades.atom", s.upgradesAtom)
@@ -216,6 +243,16 @@ func (s *Server) getWasmSpec(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.fail(w, r, err)
 		return
+	}
+	if s.signer != nil {
+		body, err := json.Marshal(stored.Interface)
+		if err != nil {
+			s.fail(w, r, fmt.Errorf("api: encoding interface for wasm %s: %w", wasmHash, err))
+			return
+		}
+		s.attest(w, r, attest.Statement{
+			Network: stored.Network, WasmHash: stored.WasmHash, Interface: body,
+		})
 	}
 	writeJSON(w, http.StatusOK, stored)
 }
@@ -435,6 +472,62 @@ func (s *Server) updateContractSource(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, contract)
 }
 
+// attest attaches a detached signature over the statement to the response.
+//
+// A signing failure leaves the response unsigned and logs it: the data is
+// still right, and a client that requires a signature will notice it is
+// missing and refuse the response, which is what the signature is for.
+func (s *Server) attest(w http.ResponseWriter, r *http.Request, st attest.Statement) {
+	if s.signer == nil {
+		return
+	}
+	sig, err := s.signer.Sign(st)
+	if err != nil {
+		s.log.ErrorContext(r.Context(), "signing interface response failed")
+		return
+	}
+	w.Header().Set(attest.SignatureHeader, sig)
+	w.Header().Set(attest.KeyIDHeader, s.signer.KeyID())
+}
+
+// getKeys serves GET /api/keys: the public keys interface signatures verify
+// against. The list is empty when the registry does not sign.
+func (s *Server) getKeys(w http.ResponseWriter, _ *http.Request) {
+	keys := s.keys
+	if keys == nil {
+		keys = []attest.Key{}
+	}
+	writeJSON(w, http.StatusOK, keysResponse{Keys: keys})
+}
+
+// verifyPublisher serves POST /api/contracts/{id}/verify.
+//
+// The body is a claim signed by the account that deployed the contract; see
+// registry.VerifyPublisher for what makes one acceptable. Nothing else
+// authenticates the caller, because the signature is the authentication.
+func (s *Server) verifyPublisher(w http.ResponseWriter, r *http.Request) {
+	var req verifyRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.Claim.ContractID != chi.URLParam(r, "id") {
+		writeError(w, http.StatusBadRequest, "claim.contract_id does not match the contract in the URL")
+		return
+	}
+
+	contract, err := s.reg.VerifyPublisher(r.Context(), registry.PublisherClaim{
+		Claim:     req.Claim,
+		Signer:    strings.TrimSpace(req.Signer),
+		Signature: strings.TrimSpace(req.Signature),
+	})
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, contract)
+}
+
 // deprecationRequest is the body of PUT /contracts/{id}/deprecation. Both
 // fields are optional: a contract can be retired without a recorded
 // destination.
@@ -466,10 +559,6 @@ func (s *Server) setContractDeprecation(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if successor != "" {
-		// The link the registry hands users has to serve them: the
-		// successor must be registered on the same network, or the
-		// deprecation would point somewhere this deployment knows
-		// nothing about.
 		if _, err := s.reg.Store().GetContract(r.Context(), network, successor); err != nil {
 			writeError(w, http.StatusBadRequest, "successor "+successor+" is not registered on "+network)
 			return
@@ -864,6 +953,10 @@ func (s *Server) getContract(w http.ResponseWriter, r *http.Request) {
 		responseHash = ""
 		interfaceID = stellar.BuiltinSACIdentifier
 	}
+	s.attest(w, r, attest.Statement{
+		Network: contract.Network, ContractID: contract.ContractID,
+		WasmHash: cacheHash, Interface: cached.body,
+	})
 	writeJSON(w, http.StatusOK, contractResponse{
 		ContractID:   contract.ContractID,
 		Network:      contract.Network,
@@ -877,6 +970,8 @@ func (s *Server) getContract(w http.ResponseWriter, r *http.Request) {
 		FirstSeen:    contract.FirstSeen.UTC(),
 		DecodedAt:    cached.decodedAt,
 		MissingSince: contract.MissingSince,
+		Origin:       originOf(*contract),
+		Verified:     verifiedOf(*contract),
 		Current:      cacheHash == contract.CurrentWasmHash,
 		Interface:    json.RawMessage(cached.body),
 	})
@@ -1413,12 +1508,20 @@ func (s *Server) errorStatus(r *http.Request, err error) (int, string) {
 	case errors.Is(err, registry.ErrBusy):
 		return http.StatusServiceUnavailable, err.Error()
 
+	case errors.Is(err, registry.ErrInvalidClaim):
+		return http.StatusBadRequest, err.Error()
+
+	case errors.Is(err, registry.ErrNotDeployer):
+		return http.StatusForbidden, err.Error()
+
+	case errors.Is(err, registry.ErrStaleClaim), errors.Is(err, registry.ErrDeployerUnknown):
+		return http.StatusUnprocessableEntity, err.Error()
+
 	case isBadContractID(err), errors.Is(err, registry.ErrInvalidWasmHash):
 		return http.StatusBadRequest, err.Error()
 
 	default:
-		s.log.ErrorContext(r.Context(), "request failed",
-			"path", r.URL.Path, "method", r.Method, "error", err)
+		s.log.ErrorContext(r.Context(), "request failed")
 		return http.StatusInternalServerError, "internal error"
 	}
 }

@@ -53,6 +53,10 @@ Configuration is read from the environment:
   MAX_CONCURRENT_REGISTRATIONS registrations at once     (default 4)
   HTTP_ADDR                   listen address for serve  (default :8080)
   LOG_LEVEL                   debug|info|warn|error     (default info)
+  REFRESH_EVENTS              refresh on upgrade events (default false; needs REFRESH_INTERVAL)
+  REFRESH_EVENTS_INTERVAL     how often to read events  (default 10s)
+  SIGNING_KEY                 sign interface responses  (base64 Ed25519 seed; or SIGNING_KEY_FILE)
+  SIGNING_RETIRED_KEYS        old public keys to publish (comma-separated base64)
 
 A YAML file can supply the same settings as the base layer:
 
@@ -95,6 +99,9 @@ secrets redacted.`,
 		newServeCmd(),
 		newMigrateCmd(),
 		newDoctorCmd(doctorDepsFromEnv),
+		newBackfillCmd(),
+		newClaimCmd(),
+		newKeygenCmd(),
 		newConfigCmd(),
 	)
 

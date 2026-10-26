@@ -20,6 +20,7 @@ import (
 	"github.com/soroworks/sorovault/internal/config"
 	"github.com/soroworks/sorovault/internal/refresher"
 	"github.com/soroworks/sorovault/internal/registry"
+	"github.com/soroworks/sorovault/internal/stellar"
 	"github.com/soroworks/sorovault/internal/store"
 	"github.com/soroworks/sorovault/internal/web"
 )
@@ -89,18 +90,31 @@ func startRefresher(ctx context.Context, a *app) (r *refresher.Refresher, stop f
 		return nil, nil, err
 	}
 
-	r, err = refresher.New(a.registry, refresher.Options{
+	opts := refresher.Options{
 		Interval: a.cfg.RefreshInterval,
 		Timeout:  a.cfg.RPCTimeout,
 		Notifier: notifier,
 		Logger:   a.log.With("component", "refresher"),
-	})
+	}
+	if a.cfg.RefreshEvents {
+		follower, ok := a.fetcher.(stellar.UpdateFollower)
+		if !ok {
+			return nil, nil, errors.New("REFRESH_EVENTS is set but the configured fetcher cannot read upgrade events")
+		}
+		opts.Events = follower
+		opts.EventsInterval = a.cfg.RefreshEventsInterval
+	}
+
+	r, err = refresher.New(a.registry, opts)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	stop = startRefresherLoop(ctx, a.cfg.RefreshInterval, r.Run)
-	a.log.Info("automatic refresh enabled", "interval", a.cfg.RefreshInterval)
+	a.log.Info("automatic refresh enabled",
+		"interval", a.cfg.RefreshInterval,
+		"events", a.cfg.RefreshEvents,
+		"events_interval", a.cfg.RefreshEventsInterval)
 	return r, stop, nil
 }
 
@@ -187,6 +201,10 @@ func newRouter(reg *registry.Registry, log *slog.Logger, refresh *refresher.Refr
 			server.SetAPITokens(cfg.APITokens)
 			ui.SetWriteAuthRequired(true)
 		}
+	}
+	if cfg != nil && cfg.Signer != nil {
+		server.SetSigner(cfg.Signer, cfg.RetiredSigningKeys...)
+		log.Info("signing interface responses", "key_id", cfg.Signer.KeyID())
 	}
 
 	r := chi.NewRouter()

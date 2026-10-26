@@ -224,14 +224,17 @@ func (p *Postgres) Save(ctx context.Context, c Contract, iface *model.Interface)
 // GetContract returns one contract's current state.
 func (p *Postgres) GetContract(ctx context.Context, network, contractID string) (*Contract, error) {
 	const q = `
-		SELECT network, contract_id, current_wasm_hash, name, source_url, source_commit, first_seen, last_refreshed, missing_since, implements, deprecated_since, successor, deprecation_note
+		SELECT network, contract_id, current_wasm_hash, name, source_url, source_commit, first_seen, last_refreshed, missing_since,
+		       implements, deprecated_since, successor, deprecation_note, creator, created_ledger, verified_by, verified_at, verified_wasm_hash
 		FROM contracts
 		WHERE network = $1 AND contract_id = $2`
 
 	var c Contract
 	err := p.pool.QueryRow(ctx, q, network, contractID).Scan(
 		&c.Network, &c.ContractID, &c.CurrentWasmHash, &c.Name, &c.SourceURL, &c.SourceCommit,
-		&c.FirstSeen, &c.LastRefreshed, &c.MissingSince, &c.Implements, &c.DeprecatedSince, &c.Successor, &c.DeprecationNote,
+		&c.FirstSeen, &c.LastRefreshed, &c.MissingSince,
+		&c.Implements, &c.DeprecatedSince, &c.Successor, &c.DeprecationNote,
+		&c.Creator, &c.CreatedLedger, &c.VerifiedBy, &c.VerifiedAt, &c.VerifiedWasmHash,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("%w: contract %s on %s", ErrNotFound, contractID, network)
@@ -309,6 +312,62 @@ func (p *Postgres) UpdateSource(ctx context.Context, network, contractID, source
 	return nil
 }
 
+// SetOrigin records who created a contract and in which ledger.
+func (p *Postgres) SetOrigin(ctx context.Context, network, contractID, creator string, ledger uint32) error {
+	const q = `UPDATE contracts SET creator = $3, created_ledger = $4 WHERE network = $1 AND contract_id = $2`
+	tag, err := p.pool.Exec(ctx, q, network, contractID, creator, int64(ledger))
+	if err != nil {
+		return fmt.Errorf("store: recording origin of %s: %w", contractID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: contract %s on %s", ErrNotFound, contractID, network)
+	}
+	return nil
+}
+
+// SetVerified records an accepted publisher claim and the name and source it
+// carried.
+func (p *Postgres) SetVerified(ctx context.Context, network, contractID, name, sourceURL, sourceCommit string, v Verification) error {
+	const q = `
+		UPDATE contracts SET
+			name = $3, source_url = $4, source_commit = $5,
+			verified_by = $6, verified_at = $7, verified_wasm_hash = $8
+		WHERE network = $1 AND contract_id = $2`
+	tag, err := p.pool.Exec(ctx, q, network, contractID, name, sourceURL, sourceCommit,
+		v.Publisher, v.VerifiedAt.UTC(), v.WasmHash)
+	if err != nil {
+		return fmt.Errorf("store: verifying %s: %w", contractID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: contract %s on %s", ErrNotFound, contractID, network)
+	}
+	return nil
+}
+
+// GetState returns a persisted value.
+func (p *Postgres) GetState(ctx context.Context, key string) (string, error) {
+	var value string
+	err := p.pool.QueryRow(ctx, `SELECT value FROM state WHERE key = $1`, key).Scan(&value)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("%w: state %q", ErrNotFound, key)
+	}
+	if err != nil {
+		return "", fmt.Errorf("store: reading state %q: %w", key, err)
+	}
+	return value, nil
+}
+
+// SetState stores a value under key.
+func (p *Postgres) SetState(ctx context.Context, key, value string) error {
+	const q = `
+		INSERT INTO state (key, value) VALUES ($1, $2)
+		ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`
+	if _, err := p.pool.Exec(ctx, q, key, value); err != nil {
+		return fmt.Errorf("store: writing state %q: %w", key, err)
+	}
+	return nil
+}
+
 // Delete removes a contract and every version stored for it. The specs
 // foreign key cascades, so one statement removes the whole history.
 func (p *Postgres) Delete(ctx context.Context, network, contractID string) error {
@@ -327,7 +386,9 @@ func (p *Postgres) Delete(ctx context.Context, network, contractID string) error
 func (p *Postgres) Export(ctx context.Context) (*Snapshot, error) {
 	const contractsQuery = `
 		SELECT network, contract_id, current_wasm_hash, name, source_url, source_commit,
-		       first_seen, last_refreshed, missing_since, deprecated_since, successor, deprecation_note
+		       first_seen, last_refreshed, missing_since,
+		       implements, deprecated_since, successor, deprecation_note,
+		       creator, created_ledger, verified_by, verified_at, verified_wasm_hash
 		FROM contracts
 		ORDER BY network, contract_id`
 
@@ -343,7 +404,9 @@ func (p *Postgres) Export(ctx context.Context) (*Snapshot, error) {
 		var c Contract
 		if err := rows.Scan(
 			&c.Network, &c.ContractID, &c.CurrentWasmHash, &c.Name, &c.SourceURL, &c.SourceCommit,
-			&c.FirstSeen, &c.LastRefreshed, &c.MissingSince, &c.DeprecatedSince, &c.Successor, &c.DeprecationNote,
+			&c.FirstSeen, &c.LastRefreshed, &c.MissingSince,
+			&c.Implements, &c.DeprecatedSince, &c.Successor, &c.DeprecationNote,
+			&c.Creator, &c.CreatedLedger, &c.VerifiedBy, &c.VerifiedAt, &c.VerifiedWasmHash,
 		); err != nil {
 			return nil, fmt.Errorf("store: scanning exported contract: %w", err)
 		}
@@ -419,9 +482,11 @@ func (p *Postgres) Import(ctx context.Context, snapshot *Snapshot, merge bool) e
 	const insertContract = `
 		INSERT INTO contracts (
 			network, contract_id, current_wasm_hash, name, source_url, source_commit,
-			first_seen, last_refreshed, missing_since, deprecated_since, successor, deprecation_note
+			first_seen, last_refreshed, missing_since,
+			implements, deprecated_since, successor, deprecation_note,
+			creator, created_ledger, verified_by, verified_at, verified_wasm_hash
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 		ON CONFLICT (network, contract_id) DO NOTHING`
 
 	const insertSpec = `
@@ -433,7 +498,9 @@ func (p *Postgres) Import(ctx context.Context, snapshot *Snapshot, merge bool) e
 		c := cs.Contract
 		if _, err := tx.Exec(ctx, insertContract,
 			c.Network, c.ContractID, c.CurrentWasmHash, c.Name, c.SourceURL, c.SourceCommit,
-			c.FirstSeen, c.LastRefreshed, c.MissingSince, c.DeprecatedSince, c.Successor, c.DeprecationNote); err != nil {
+			c.FirstSeen, c.LastRefreshed, c.MissingSince,
+			c.Implements, c.DeprecatedSince, c.Successor, c.DeprecationNote,
+			c.Creator, int64(c.CreatedLedger), c.VerifiedBy, c.VerifiedAt, c.VerifiedWasmHash); err != nil {
 			return fmt.Errorf("store: importing contract %s: %w", c.ContractID, err)
 		}
 
@@ -482,7 +549,9 @@ func (p *Postgres) ListContracts(ctx context.Context, f ListFilter) (*ContractPa
 	const q = `
 		WITH matched AS (
 			SELECT c.network, c.contract_id, c.current_wasm_hash, c.name, c.source_url, c.source_commit,
-			       c.first_seen, c.last_refreshed, c.missing_since, c.implements, c.deprecated_since, c.successor, c.deprecation_note,
+			       c.first_seen, c.last_refreshed, c.missing_since,
+			       c.implements, c.deprecated_since, c.successor, c.deprecation_note,
+			       c.creator, c.created_ledger, c.verified_by, c.verified_at, c.verified_wasm_hash,
 			       COALESCE(s.symbols, '') AS symbols, COALESCE(s.docs_tsv, ''::tsvector) AS docs,
 			       ($2 = '' OR c.contract_id ILIKE '%' || $2 || '%'
 			               OR c.name ILIKE '%' || $2 || '%'
@@ -522,7 +591,9 @@ func (p *Postgres) ListContracts(ctx context.Context, f ListFilter) (*ContractPa
 			  AND (COALESCE(cardinality($5::text[]), 0) = 0 OR c.implements @> $5::text[])
 		)
 		SELECT network, contract_id, current_wasm_hash, name, source_url, source_commit, first_seen, last_refreshed,
-		       missing_since, implements, deprecated_since, successor, deprecation_note, symbols, name_hit, count(*) OVER () AS total
+		       missing_since, implements, deprecated_since, successor, deprecation_note,
+		       creator, created_ledger, verified_by, verified_at, verified_wasm_hash,
+		       symbols, name_hit, count(*) OVER () AS total
 		FROM matched
 		WHERE ($8::timestamptz IS NULL
 		       OR (CASE WHEN name_hit THEN 0 ELSE 1 END) > $12
@@ -577,7 +648,10 @@ func (p *Postgres) ListContracts(ctx context.Context, f ListFilter) (*ContractPa
 		var total int
 		if err := rows.Scan(
 			&c.Network, &c.ContractID, &c.CurrentWasmHash, &c.Name, &c.SourceURL, &c.SourceCommit,
-			&c.FirstSeen, &c.LastRefreshed, &c.MissingSince, &c.Implements, &c.DeprecatedSince, &c.Successor, &c.DeprecationNote, &symbols, &nameHit, &total,
+			&c.FirstSeen, &c.LastRefreshed, &c.MissingSince,
+			&c.Implements, &c.DeprecatedSince, &c.Successor, &c.DeprecationNote,
+			&c.Creator, &c.CreatedLedger, &c.VerifiedBy, &c.VerifiedAt, &c.VerifiedWasmHash,
+			&symbols, &nameHit, &total,
 		); err != nil {
 			return nil, fmt.Errorf("store: scanning contract: %w", err)
 		}
@@ -639,7 +713,8 @@ func (p *Postgres) ListContractsByWasm(ctx context.Context, f WasmFilter) (*Wasm
 	const q = `
 		SELECT c.network, c.contract_id, c.current_wasm_hash, c.name, c.source_url, c.source_commit,
 		       c.first_seen, c.last_refreshed, c.missing_since,
-		       c.deprecated_since, c.successor, c.deprecation_note,
+		       c.implements, c.deprecated_since, c.successor, c.deprecation_note,
+		       c.creator, c.created_ledger, c.verified_by, c.verified_at, c.verified_wasm_hash,
 		       c.current_wasm_hash = $2 AS current,
 		       count(*) OVER () AS total
 		FROM contracts c
@@ -663,7 +738,10 @@ func (p *Postgres) ListContractsByWasm(ctx context.Context, f WasmFilter) (*Wasm
 		var total int
 		if err := rows.Scan(
 			&c.Network, &c.ContractID, &c.CurrentWasmHash, &c.Name, &c.SourceURL, &c.SourceCommit,
-			&c.FirstSeen, &c.LastRefreshed, &c.MissingSince, &c.DeprecatedSince, &c.Successor, &c.DeprecationNote, &c.Current, &total,
+			&c.FirstSeen, &c.LastRefreshed, &c.MissingSince,
+			&c.Implements, &c.DeprecatedSince, &c.Successor, &c.DeprecationNote,
+			&c.Creator, &c.CreatedLedger, &c.VerifiedBy, &c.VerifiedAt, &c.VerifiedWasmHash,
+			&c.Current, &total,
 		); err != nil {
 			return nil, fmt.Errorf("store: scanning contract: %w", err)
 		}
@@ -768,7 +846,8 @@ func (p *Postgres) Stats(ctx context.Context) (*Stats, error) {
 	}
 
 	const latestQ = `
-		SELECT network, contract_id, current_wasm_hash, name, source_url, source_commit, first_seen, last_refreshed, missing_since
+		SELECT network, contract_id, current_wasm_hash, name, source_url, source_commit, first_seen, last_refreshed, missing_since,
+		       creator, created_ledger, verified_by, verified_at, verified_wasm_hash
 		FROM contracts
 		ORDER BY first_seen DESC, contract_id
 		LIMIT 1`
@@ -778,6 +857,7 @@ func (p *Postgres) Stats(ctx context.Context) (*Stats, error) {
 		&latest.Network, &latest.ContractID, &latest.CurrentWasmHash, &latest.Name,
 		&latest.SourceURL, &latest.SourceCommit, &latest.FirstSeen, &latest.LastRefreshed,
 		&latest.MissingSince,
+		&latest.Creator, &latest.CreatedLedger, &latest.VerifiedBy, &latest.VerifiedAt, &latest.VerifiedWasmHash,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return stats, nil
