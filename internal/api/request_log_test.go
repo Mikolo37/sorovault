@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/assert"
@@ -90,6 +91,9 @@ func requestLogRouter(log *slog.Logger) http.Handler {
 	// bytes written, and echoing the path back would put the very ID the
 	// log must not carry into the response.
 	apiRouter.Get("/contracts/{id}", func(w http.ResponseWriter, _ *http.Request) {
+		// Keep elapsed time above zero even on platforms whose monotonic
+		// clock has coarse resolution (notably Windows).
+		time.Sleep(time.Millisecond)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_, _ = io.WriteString(w, `{"contract_id":"logged"}`+"\n")
 	})
