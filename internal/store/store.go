@@ -1,17 +1,21 @@
 // Package store persists the contract registry.
 //
-// The registry keeps two things per contract: a row tracking which WASM the
-// contract currently runs, and one immutable spec row per WASM hash it has
-// ever run. Refreshing a contract therefore appends a version rather than
-// overwriting one, so an interface that was live at some point stays
-// retrievable after the contract is upgraded.
+// The registry keeps two things per contract: a row tracking its current
+// interface version identifier, and one immutable spec row per identifier it
+// has ever used. Uploaded contracts use their WASM hash; protocol-provided
+// contracts such as SACs use a stable built-in identifier. Refreshing a
+// contract therefore appends a version rather than overwriting one.
 package store
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/soroworks/sorovault/internal/model"
 )
@@ -60,6 +64,23 @@ type Contract struct {
 	SourceCommit    string    `json:"source_commit,omitempty"`
 	FirstSeen       time.Time `json:"first_seen"`
 	LastRefreshed   time.Time `json:"last_refreshed"`
+	// ObservedLedger is only passed to Save for a newly observed version.
+	ObservedLedger *uint32 `json:"-"`
+
+	// Creator is the account that created the contract, and CreatedLedger
+	// the ledger it was created in. Both are zero when they could not be
+	// determined: the RPC only keeps recent history, so a contract older
+	// than its retention window usually has neither.
+	Creator       string `json:"creator,omitempty"`
+	CreatedLedger uint32 `json:"created_ledger,omitempty"`
+
+	// VerifiedBy is the account whose signed claim verified this contract's
+	// publisher, VerifiedAt when the claim was accepted, and
+	// VerifiedWasmHash the version the claim was made for. All are zero for
+	// a contract nobody has verified.
+	VerifiedBy       string     `json:"verified_by,omitempty"`
+	VerifiedAt       *time.Time `json:"verified_at,omitempty"`
+	VerifiedWasmHash string     `json:"verified_wasm_hash,omitempty"`
 
 	// MissingSince is when a refresh first found the contract absent from
 	// the network. It is nil while the contract is live, and is cleared by
@@ -67,10 +88,42 @@ type Contract struct {
 	// again.
 	MissingSince *time.Time `json:"missing_since,omitempty"`
 
+	// Implements lists the standard interface IDs detected from the current
+	// decoded interface, such as "sep41".
+	Implements []string `json:"implements,omitempty"`
+
+	// DeprecatedSince is when the contract was marked deprecated: it has a
+	// replacement and users should stop building on it. It is nil while
+	// the contract is in active use, and survives refreshes — being live
+	// on the network says nothing about being the recommended one to use.
+	DeprecatedSince *time.Time `json:"deprecated_since,omitempty"`
+
+	// Successor is the contract ID that replaces a deprecated one. Empty
+	// means the tooling has retired the contract without agreeing where
+	// to go.
+	Successor string `json:"successor,omitempty"`
+
+	// DeprecationNote says how to move over, from the tooling that marked
+	// the contract deprecated.
+	DeprecationNote string `json:"deprecation_note,omitempty"`
+
 	// Matches lists the interface symbols — functions, types, events — that
 	// a search query matched. It is only set on search results, and is
 	// empty when the query matched the contract ID or name instead.
 	Matches []string `json:"matches,omitempty"`
+}
+
+// Verified reports whether a publisher has verified the contract.
+func (c Contract) Verified() bool { return c.VerifiedBy != "" && c.VerifiedAt != nil }
+
+// Verification is an accepted publisher claim.
+type Verification struct {
+	// Publisher is the account that signed the claim.
+	Publisher string
+	// VerifiedAt is when the registry accepted it.
+	VerifiedAt time.Time
+	// WasmHash is the version of the contract the claim was made for.
+	WasmHash string
 }
 
 // symbolSeparator joins symbol names into the single searchable string the
@@ -99,6 +152,88 @@ func matchSymbols(joined, query string) []string {
 		}
 	}
 	return out
+}
+
+// joinDocs renders an interface's doc comments for full-text search: the
+// docs of every function and user-defined type, newline-separated. Events
+// stay out — they are not the callable surface a search over "what does
+// this contract do" is about.
+func joinDocs(iface *model.Interface) string {
+	if iface == nil {
+		return ""
+	}
+	var docs []string
+	add := func(doc string) {
+		if doc != "" {
+			docs = append(docs, doc)
+		}
+	}
+	for _, fn := range iface.Functions {
+		add(fn.Doc)
+	}
+	for _, s := range iface.Types.Structs {
+		add(s.Doc)
+	}
+	for _, u := range iface.Types.Unions {
+		add(u.Doc)
+	}
+	for _, e := range iface.Types.Enums {
+		add(e.Doc)
+	}
+	for _, e := range iface.Types.ErrorEnums {
+		add(e.Doc)
+	}
+	return strings.Join(docs, symbolSeparator)
+}
+
+// docTerms splits a query into the terms full-text search matches against:
+// lowercased runs of letters and digits, so punctuation, emoji and other
+// noise drop out instead of being searched for literally. Splitting on
+// punctuation keeps "vault!" and "vault" finding the same docs, and it is
+// the part of the matcher both stores must apply the same way — the
+// Postgres tsquery is built out of exactly these words.
+func docTerms(text string) []string {
+	return strings.FieldsFunc(text, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+}
+
+// docMatchLower is what docTerms works on: Unicode case folding covers all
+// scripts, and lowercasing once here means the term and the doc text go
+// through the same fold.
+func docMatchLower(text string) []string {
+	return docTerms(strings.ToLower(text))
+}
+
+// matchDocs reports whether every term of query appears in the joined doc
+// blob, as a whole word or by common prefix. An empty blob or a query with
+// nothing word-like in it matches nothing.
+//
+// The prefix slack stands in for the case folding a tsvector applies: a
+// query "swap" has to find a doc about "swaps", and "SWAP" about either.
+// Both directions of the prefix test matter for that, and they stay in
+// step with the Postgres side, which the shared conformance suite pins:
+// it builds one lowercased prefix query per term out of the very words
+// docMatchLower yields, so a term landing in a doc ballparks its tsquery.
+func matchDocs(docs, query string) bool {
+	terms := docMatchLower(query)
+	if len(terms) == 0 {
+		return false
+	}
+	tokens := docMatchLower(docs)
+	for _, term := range terms {
+		found := false
+		for _, token := range tokens {
+			if strings.HasPrefix(token, term) || strings.HasPrefix(term, token) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 // hasFunction reports whether an interface declares a function with exactly
@@ -176,6 +311,8 @@ type Spec struct {
 	WasmHash   string           `json:"wasm_hash"`
 	Interface  *model.Interface `json:"interface"`
 	DecodedAt  time.Time        `json:"decoded_at"`
+	// ObservedLedger is the ledger at observation, not the upgrade ledger.
+	ObservedLedger *uint32 `json:"observed_ledger"`
 }
 
 // WasmSpec is a decoded interface for uploaded code that no registered
@@ -190,18 +327,24 @@ type WasmSpec struct {
 // SpecVersion summarises a stored spec without its body, for listing the
 // versions of a contract cheaply.
 type SpecVersion struct {
-	WasmHash  string    `json:"wasm_hash"`
-	DecodedAt time.Time `json:"decoded_at"`
-	Current   bool      `json:"current"`
+	WasmHash    string    `json:"wasm_hash,omitempty"`
+	InterfaceID string    `json:"interface_id,omitempty"`
+	Builtin     bool      `json:"builtin,omitempty"`
+	DecodedAt   time.Time `json:"decoded_at"`
+	Current     bool      `json:"current"`
+	// ObservedLedger is the ledger at observation, not the upgrade ledger.
+	ObservedLedger *uint32 `json:"observed_ledger"`
 }
 
 // ListFilter selects and pages a contract listing.
 type ListFilter struct {
 	// Network restricts results to one network. Empty means all networks.
 	Network string
-	// Query is a case-insensitive substring match against contract ID,
-	// name, and the names of the functions, types and events in the
-	// contract's current interface. Empty matches everything.
+	// Query is a case-insensitive match against contract ID, name, and the
+	// names of the functions, types and events in the contract's current
+	// interface, and — ranked below those — a whole-word search over the
+	// doc comments of its functions and user-defined types, where every
+	// word of the query must be found. Empty matches everything.
 	Query string
 	// Functions restricts results to contracts whose current interface
 	// declares a function with exactly this name. Every name must match,
@@ -210,11 +353,25 @@ type ListFilter struct {
 	// Types restricts results to contracts whose current interface declares
 	// a user-defined type with exactly this name. Every name must match.
 	Types []string
+	// Implements restricts results to contracts implementing every listed standard ID.
+	Implements []string
 	// Limit is the maximum number of rows to return. Zero means
 	// DefaultLimit; anything above MaxLimit is clamped to MaxLimit.
 	Limit int
-	// Offset is the number of rows to skip.
+	// Offset is the number of rows to skip. Offset paging is kept for
+	// compatibility — it never breaks outright — but cursor paging below
+	// is what callers should reach for: offsets grow slower as the
+	// registry grows, and rows added while a client pages make offset
+	// pages repeat and skip each other. (The Go doc does not carry the
+	// formal Deprecated marker, because staticcheck then rejects the
+	// compatibility paths that still must honor it — the deprecation is
+	// voiced at the API surface instead.)
 	Offset int
+	// Cursor continues from where a previous page ended. An empty cursor
+	// starts from the top, so a first request carries none. A cursor and
+	// an offset are exclusive: ask for one page in one of the two ways.
+	// A cursor the store cannot read is ErrMalformedCursor.
+	Cursor string
 }
 
 // Paging bounds for ListFilter.
@@ -235,6 +392,7 @@ func (f *ListFilter) Normalize() {
 	f.Query = strings.ReplaceAll(f.Query, "\x00", "\uFFFD")
 	f.Functions = cleanNames(f.Functions)
 	f.Types = cleanNames(f.Types)
+	f.Implements = cleanNames(f.Implements)
 	if f.Limit <= 0 {
 		f.Limit = DefaultLimit
 	}
@@ -260,11 +418,27 @@ func cleanNames(names []string) []string {
 	return out
 }
 
+func hasAllStandards(have, want []string) bool {
+	present := make(map[string]struct{}, len(have))
+	for _, id := range have {
+		present[id] = struct{}{}
+	}
+	for _, id := range want {
+		if _, ok := present[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 // ContractPage is one page of a contract listing.
 type ContractPage struct {
 	Contracts []Contract `json:"contracts"`
 	// Total is how many contracts match the filter, ignoring paging.
 	Total int `json:"total"`
+	// Next carries the cursor of the following page when this page did
+	// not reach the end of the matches. Empty means the walk is over.
+	Next string `json:"next"`
 }
 
 // WasmFilter selects the contracts that run a given WASM hash.
@@ -388,6 +562,32 @@ type UpgradePage struct {
 	Total int `json:"total"`
 }
 
+// Subscription is a per-contract webhook subscription.
+type Subscription struct {
+	ID          string    `json:"id"`
+	Network     string    `json:"network"`
+	ContractIDs []string  `json:"contract_ids"`
+	URL         string    `json:"url"`
+	Secret      string    `json:"-"`
+	Active      bool      `json:"active"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// SubscribeRequest is the request body for creating a subscription.
+type SubscribeRequest struct {
+	ContractIDs []string `json:"contract_ids"`
+	URL         string   `json:"url"`
+}
+
+// SubscriptionListItem is a summary of a subscription for listing.
+type SubscriptionListItem struct {
+	ID        string `json:"id"`
+	Network   string `json:"network"`
+	Contracts int    `json:"contracts"`
+	Active    bool   `json:"active"`
+	CreatedAt string `json:"created_at"`
+}
+
 // Store is the registry's persistence layer.
 //
 // Implementations must be safe for concurrent use. Two are provided: Postgres
@@ -395,6 +595,32 @@ type UpgradePage struct {
 type Store interface {
 	// UpdateSource attaches repository metadata to an existing contract.
 	UpdateSource(ctx context.Context, network, contractID, sourceURL, sourceCommit string) error
+
+	// SetOrigin records who created the contract and in which ledger. Both
+	// must be set; recording an origin is how an unknown one becomes known.
+	SetOrigin(ctx context.Context, network, contractID, creator string, ledger uint32) error
+
+	// SetVerified records an accepted publisher claim, together with the
+	// name and source the claim carried, in one step so a contract is never
+	// verified for a name or source it does not have.
+	SetVerified(ctx context.Context, network, contractID, name, sourceURL, sourceCommit string, v Verification) error
+
+	// GetState returns a small persisted value, such as the refresher's
+	// event cursor. It returns ErrNotFound when the key was never set.
+	GetState(ctx context.Context, key string) (string, error)
+
+	// SetState stores a value under key, replacing any earlier one.
+	SetState(ctx context.Context, key, value string) error
+
+	// SetDeprecation marks an existing contract deprecated, with an
+	// optional successor contract ID and note. A successor the caller must
+	// verify — registered on the same network, a contract other than the
+	// one being deprecated — is the API's job, not the store's.
+	SetDeprecation(ctx context.Context, network, contractID, successor, note string) error
+
+	// ClearDeprecation lifts the mark, restoring the contract to active
+	// use.
+	ClearDeprecation(ctx context.Context, network, contractID string) error
 
 	// Delete removes a contract and every interface version stored for it.
 	// It returns ErrNotFound when the contract is not in the registry.
@@ -467,6 +693,38 @@ type Store interface {
 	// ListVersions returns every stored version of a contract, newest first.
 	ListVersions(ctx context.Context, network, contractID string) ([]SpecVersion, error)
 
+	// GetSubscription returns a subscription by its secret (ID).
+	GetSubscription(ctx context.Context, secret string) (*Subscription, error)
+
+	// MarkSubscriptionInactive marks a subscription as inactive.
+	MarkSubscriptionInactive(ctx context.Context, secret string) error
+
+	// Ping reports whether the store's backing service answers. Readiness
+	// uses it; it must not change any stored data.
+	Ping(ctx context.Context) error
+
 	// Close releases any resources held by the store.
 	Close() error
+
+	// Subscribe creates a new webhook subscription for the given network and
+	// contract IDs. Returns the subscription ID (which also serves as the
+	// secret for HMAC signing and deletion).
+	Subscribe(ctx context.Context, network string, contractIDs []string, url string) (string, error)
+
+	// ListSubscriptions returns all subscriptions, active and inactive.
+	ListSubscriptions(ctx context.Context) ([]SubscriptionListItem, error)
+
+	// Unsubscribe removes a subscription by its secret (ID).
+	Unsubscribe(ctx context.Context, secret string) error
+}
+
+// newSubscriptionSecret returns a random 256-bit subscription ID. The ID is
+// also the secret that signs deliveries and authorises deleting the
+// subscription, so it must not be guessable.
+func newSubscriptionSecret() (string, error) {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("store: generating subscription secret: %w", err)
+	}
+	return "sub_" + hex.EncodeToString(b[:]), nil
 }

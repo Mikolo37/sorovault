@@ -37,6 +37,10 @@ test-all: ## Run the tests including the Postgres store suite
 	@TEST_DATABASE_URL="$(TEST_DATABASE_URL)" go test -race ./...; \
 		status=$$?; docker rm -f $(TEST_PG_CONTAINER) >/dev/null 2>&1; exit $$status
 
+.PHONY: test-ts
+test-ts: ## Test the TypeScript attestation verifier against the Go vectors (needs Node 22.18+)
+	node --test clients/typescript/verify.test.ts
+
 .PHONY: cover
 cover: ## Write a coverage profile and print the total
 	go test -coverprofile=coverage.out -covermode=atomic ./...
@@ -51,6 +55,10 @@ GOLANGCI_LINT         := go run github.com/golangci/golangci-lint/v2/cmd/golangc
 .PHONY: lint
 lint: ## Run the pinned golangci-lint
 	$(GOLANGCI_LINT) run
+
+.PHONY: test-live
+test-live: ## Run the opt-in live smoke test against testnet (requires SOROVAULT_LIVE=1)
+	@go test -run TestLiveSmokeTest -v ./internal/stellar...
 
 .PHONY: check
 check: lint test ## Lint and test — run before opening a PR

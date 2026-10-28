@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/soroworks/sorovault/internal/attest"
 	"github.com/soroworks/sorovault/internal/model"
 	"github.com/soroworks/sorovault/internal/refresher"
 	"github.com/soroworks/sorovault/internal/store"
@@ -87,18 +88,30 @@ type listResponse struct {
 	Total     int              `json:"total"`
 	Limit     int              `json:"limit"`
 	Offset    int              `json:"offset"`
+	// Next is the cursor of the following page. Empty means the listing
+	// reached its end on this page.
+	Next string `json:"next,omitempty"`
 }
 
 type contractResponse struct {
 	ContractID   string     `json:"contract_id"`
 	Network      string     `json:"network"`
-	WasmHash     string     `json:"wasm_hash"`
+	WasmHash     string     `json:"wasm_hash,omitempty"`
+	InterfaceID  string     `json:"interface_id,omitempty"`
+	Builtin      bool       `json:"builtin,omitempty"`
 	Name         string     `json:"name,omitempty"`
+	Implements   []string   `json:"implements"`
 	SourceURL    string     `json:"source_url,omitempty"`
 	SourceCommit string     `json:"source_commit,omitempty"`
 	FirstSeen    time.Time  `json:"first_seen"`
 	DecodedAt    time.Time  `json:"decoded_at"`
 	MissingSince *time.Time `json:"missing_since,omitempty"`
+
+	// Origin says who created the contract. It is always present; Known is
+	// false when the registry could not determine it.
+	Origin originResponse `json:"origin"`
+	// Verified is present once the contract's publisher has been verified.
+	Verified *verifiedResponse `json:"verified,omitempty"`
 
 	// Current is false when an older version was requested explicitly.
 	Current bool `json:"current"`
@@ -107,9 +120,11 @@ type contractResponse struct {
 }
 
 type functionResponse struct {
-	ContractID string `json:"contract_id"`
-	Network    string `json:"network"`
-	WasmHash   string `json:"wasm_hash"`
+	ContractID  string `json:"contract_id"`
+	Network     string `json:"network"`
+	WasmHash    string `json:"wasm_hash,omitempty"`
+	InterfaceID string `json:"interface_id,omitempty"`
+	Builtin     bool   `json:"builtin,omitempty"`
 
 	// Signature is the function rendered as a one-line Rust-like
 	// declaration, for display and logging.
@@ -119,15 +134,24 @@ type functionResponse struct {
 }
 
 type functionListResponse struct {
-	ContractID string            `json:"contract_id"`
-	Network    string            `json:"network"`
-	WasmHash   string            `json:"wasm_hash"`
-	Functions  []functionSummary `json:"functions"`
+	ContractID  string            `json:"contract_id"`
+	Network     string            `json:"network"`
+	WasmHash    string            `json:"wasm_hash,omitempty"`
+	InterfaceID string            `json:"interface_id,omitempty"`
+	Builtin     bool              `json:"builtin,omitempty"`
+	Functions   []functionSummary `json:"functions"`
 }
 
 type functionSummary struct {
 	Name      string `json:"name"`
 	Signature string `json:"signature"`
+}
+
+type eventListResponse struct {
+	ContractID string        `json:"contract_id"`
+	Network    string        `json:"network"`
+	WasmHash   string        `json:"wasm_hash"`
+	Events     []model.Event `json:"events"`
 }
 
 type versionsResponse struct {
@@ -155,6 +179,8 @@ type statsResponse struct {
 	Versions       int                    `json:"versions"`
 	LatestContract *store.Contract        `json:"latest_contract,omitempty"`
 	LastRefresh    *refresher.SweepRecord `json:"last_refresh,omitempty"`
+	// ReadOnly is true when this server refuses writes.
+	ReadOnly bool `json:"read_only"`
 }
 
 type upgradeListResponse struct {
@@ -255,4 +281,52 @@ func routePattern(r *http.Request) string {
 		return pattern
 	}
 	return r.URL.Path
+}
+
+// originResponse is a contract's provenance, labelled so a client cannot
+// mistake "not determined" for an empty creator.
+type originResponse struct {
+	Known         bool   `json:"known"`
+	Creator       string `json:"creator,omitempty"`
+	CreatedLedger uint32 `json:"created_ledger,omitempty"`
+}
+
+func originOf(c store.Contract) originResponse {
+	if c.Creator == "" {
+		return originResponse{}
+	}
+	return originResponse{Known: true, Creator: c.Creator, CreatedLedger: c.CreatedLedger}
+}
+
+// verifiedResponse says who vouched for a contract, and for which version.
+type verifiedResponse struct {
+	Publisher  string    `json:"publisher"`
+	VerifiedAt time.Time `json:"verified_at"`
+	WasmHash   string    `json:"wasm_hash"`
+	// Current is false when the contract has been upgraded since the claim
+	// was made, so the publisher vouched for an earlier version.
+	Current bool `json:"current"`
+}
+
+func verifiedOf(c store.Contract) *verifiedResponse {
+	if !c.Verified() {
+		return nil
+	}
+	return &verifiedResponse{
+		Publisher:  c.VerifiedBy,
+		VerifiedAt: c.VerifiedAt.UTC(),
+		WasmHash:   c.VerifiedWasmHash,
+		Current:    c.VerifiedWasmHash == c.CurrentWasmHash,
+	}
+}
+
+// verifyRequest is the body of POST /api/contracts/{id}/verify.
+type verifyRequest struct {
+	Claim     attest.Claim `json:"claim"`
+	Signer    string       `json:"signer"`
+	Signature string       `json:"signature"`
+}
+
+type keysResponse struct {
+	Keys []attest.Key `json:"keys"`
 }

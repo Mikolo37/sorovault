@@ -1,9 +1,12 @@
 package config_test
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,9 +25,15 @@ func setEnv(t *testing.T, vars map[string]string) {
 
 	for _, key := range []string{
 		"RPC_URL", "NETWORK_PASSPHRASE", "DATABASE_URL", "DATABASE_URL_FILE",
-		"HTTP_ADDR", "LOG_LEVEL", "RPC_TIMEOUT", "REFRESH_INTERVAL",
+		"HTTP_ADDR", "TLS_CERT_FILE", "TLS_KEY_FILE",
+		"LOG_LEVEL", "LOG_FORMAT", "RPC_TIMEOUT", "REFRESH_INTERVAL",
 		"MAX_CONCURRENT_REGISTRATIONS", "REFRESH_WEBHOOK_URL",
-		"REFRESH_WEBHOOK_SECRET",
+		"REFRESH_WEBHOOK_SECRET", "REFRESH_EVENTS", "REFRESH_EVENTS_INTERVAL",
+		"SIGNING_KEY", "SIGNING_KEY_FILE", "SIGNING_RETIRED_KEYS",
+		"CORS_ORIGINS", "RATE_LIMIT_PER_MINUTE",
+		"RATE_LIMIT_BURST", "TRUST_X_FORWARDED_FOR", "READ_ONLY",
+		"API_TOKENS",
+		"DATABASE_MAX_CONNS", "DATABASE_MIN_CONNS",
 	} {
 		if v, ok := vars[key]; ok {
 			t.Setenv(key, v)
@@ -45,10 +54,19 @@ func TestLoadDefaults(t *testing.T) {
 	assert.Equal(t, config.DefaultHTTPAddr, cfg.HTTPAddr)
 	assert.Equal(t, testDatabaseURL, cfg.DatabaseURL)
 	assert.Equal(t, slog.LevelInfo, cfg.LogLevel)
+	assert.Equal(t, config.LogFormatText, cfg.LogFormat)
 	assert.Equal(t, config.DefaultRPCTimeout, cfg.RPCTimeout)
 	assert.Zero(t, cfg.RefreshInterval, "automatic refresh is opt-in")
 	assert.Zero(t, cfg.MaxConcurrentRegistrations,
 		"the concurrency limit is left to the registry unless it is configured")
+	assert.Zero(t, cfg.DatabaseMaxConns, "the pool size is left to pgx unless it is configured")
+	assert.Zero(t, cfg.DatabaseMinConns, "the pool size is left to pgx unless it is configured")
+	assert.Empty(t, cfg.TLSCertFile, "TLS is opt-in")
+	assert.Empty(t, cfg.TLSKeyFile, "TLS is opt-in")
+	assert.Empty(t, cfg.CORSOrigins, "CORS is opt-in")
+	assert.Equal(t, config.DefaultRateLimitPerMinute, cfg.RateLimitPerMinute)
+	assert.Equal(t, config.DefaultRateLimitBurst, cfg.RateLimitBurst)
+	assert.False(t, cfg.TrustXForwardedFor)
 }
 
 func TestLoadOverrides(t *testing.T) {
@@ -71,6 +89,68 @@ func TestLoadOverrides(t *testing.T) {
 	assert.Equal(t, "127.0.0.1:9999", cfg.HTTPAddr)
 	assert.Equal(t, slog.LevelDebug, cfg.LogLevel)
 	assert.Equal(t, 90*time.Second, cfg.RPCTimeout)
+}
+
+func TestLoadTLS(t *testing.T) {
+	tests := []struct {
+		name     string
+		vars     map[string]string
+		wantCert string
+		wantKey  string
+		wantErr  string
+	}{
+		{
+			name: "off by default",
+		},
+		{
+			name: "certificate and key",
+			vars: map[string]string{
+				"TLS_CERT_FILE": "/etc/sorovault/tls.crt",
+				"TLS_KEY_FILE":  "/etc/sorovault/tls.key",
+			},
+			wantCert: "/etc/sorovault/tls.crt",
+			wantKey:  "/etc/sorovault/tls.key",
+		},
+		{
+			name: "surrounding space is ignored",
+			vars: map[string]string{
+				"TLS_CERT_FILE": " /etc/sorovault/tls.crt ",
+				"TLS_KEY_FILE":  " /etc/sorovault/tls.key ",
+			},
+			wantCert: "/etc/sorovault/tls.crt",
+			wantKey:  "/etc/sorovault/tls.key",
+		},
+		{
+			name:    "certificate without key",
+			vars:    map[string]string{"TLS_CERT_FILE": "/etc/sorovault/tls.crt"},
+			wantErr: "TLS_CERT_FILE and TLS_KEY_FILE must be set together",
+		},
+		{
+			name:    "key without certificate",
+			vars:    map[string]string{"TLS_KEY_FILE": "/etc/sorovault/tls.key"},
+			wantErr: "TLS_CERT_FILE and TLS_KEY_FILE must be set together",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := map[string]string{"DATABASE_URL": testDatabaseURL}
+			for key, value := range tt.vars {
+				env[key] = value
+			}
+			setEnv(t, env)
+
+			cfg, err := config.Load()
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantCert, cfg.TLSCertFile)
+			assert.Equal(t, tt.wantKey, cfg.TLSKeyFile)
+		})
+	}
 }
 
 func TestMaxConcurrentRegistrations(t *testing.T) {
@@ -150,6 +230,129 @@ func TestMaxConcurrentRegistrations(t *testing.T) {
 	}
 }
 
+func TestDatabasePoolSize(t *testing.T) {
+	tests := []struct {
+		name    string
+		max     string
+		min     string
+		wantMax int32
+		wantMin int32
+		wantErr string
+	}{
+		{
+			name: "unset leaves pgx's own default alone",
+		},
+		{
+			name:    "both set",
+			max:     "20",
+			min:     "5",
+			wantMax: 20,
+			wantMin: 5,
+		},
+		{
+			name:    "maximum only",
+			max:     "20",
+			wantMax: 20,
+		},
+		{
+			name:    "minimum only",
+			min:     "5",
+			wantMin: 5,
+		},
+		{
+			name:    "minimum equal to the maximum",
+			max:     "4",
+			min:     "4",
+			wantMax: 4,
+			wantMin: 4,
+		},
+		{
+			name:    "smallest maximum",
+			max:     "1",
+			wantMax: 1,
+		},
+		{
+			name:    "largest maximum",
+			max:     "10000",
+			wantMax: 10000,
+		},
+		{
+			name:    "zero minimum",
+			min:     "0",
+			wantMin: 0,
+		},
+		{
+			name:    "surrounding space is ignored",
+			max:     " 12 ",
+			wantMax: 12,
+		},
+		{
+			name:    "minimum above the maximum",
+			max:     "2",
+			min:     "3",
+			wantErr: "cannot be greater than",
+		},
+		{
+			name:    "zero maximum",
+			max:     "0",
+			wantErr: "must be between",
+		},
+		{
+			name:    "negative maximum",
+			max:     "-1",
+			wantErr: "must be between",
+		},
+		{
+			name:    "maximum above the limit",
+			max:     "10001",
+			wantErr: "must be between",
+		},
+		{
+			name:    "minimum above the limit",
+			min:     "10001",
+			wantErr: "must be between",
+		},
+		{
+			name:    "maximum is not a number",
+			max:     "many",
+			wantErr: "DATABASE_MAX_CONNS",
+		},
+		{
+			name:    "minimum is not a number",
+			min:     "few",
+			wantErr: "DATABASE_MIN_CONNS",
+		},
+		{
+			name:    "maximum is not a whole number",
+			max:     "1.5",
+			wantErr: "DATABASE_MAX_CONNS",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vars := map[string]string{"DATABASE_URL": testDatabaseURL}
+			if tt.max != "" {
+				vars["DATABASE_MAX_CONNS"] = tt.max
+			}
+			if tt.min != "" {
+				vars["DATABASE_MIN_CONNS"] = tt.min
+			}
+			setEnv(t, vars)
+
+			cfg, err := config.Load()
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantMax, cfg.DatabaseMaxConns)
+			assert.Equal(t, tt.wantMin, cfg.DatabaseMinConns)
+		})
+	}
+}
+
 func TestLoadRequiresDatabaseURL(t *testing.T) {
 	setEnv(t, nil)
 
@@ -220,6 +423,344 @@ func TestLogLevels(t *testing.T) {
 	}
 }
 
+func TestLogFormat(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"text", config.LogFormatText},
+		{"json", config.LogFormatJSON},
+		{"JSON", config.LogFormatJSON},
+		{"  Text  ", config.LogFormatText},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			setEnv(t, map[string]string{"DATABASE_URL": testDatabaseURL, "LOG_FORMAT": tt.in})
+
+			cfg, err := config.Load()
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, cfg.LogFormat)
+		})
+	}
+}
+
+// TestJSONLoggerEmitsParseableLines is the contract a log system depends on:
+// every line is one JSON object with the message and its fields.
+func TestJSONLoggerEmitsParseableLines(t *testing.T) {
+	setEnv(t, map[string]string{"DATABASE_URL": testDatabaseURL, "LOG_FORMAT": "json"})
+
+	cfg, err := config.Load()
+	require.NoError(t, err)
+
+	f, err := os.CreateTemp(t.TempDir(), "sorovault-log")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.Remove(f.Name()) })
+
+	cfg.NewLogger(f).Info("sweep complete", "contracts", 3, "failed", 1)
+	require.NoError(t, f.Close())
+
+	body, err := os.ReadFile(f.Name())
+	require.NoError(t, err)
+
+	lines := strings.Split(strings.TrimSpace(string(body)), "\n")
+	require.Len(t, lines, 1)
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal([]byte(lines[0]), &got), "line was not JSON: %s", lines[0])
+	assert.Equal(t, "sweep complete", got["msg"])
+	assert.Equal(t, float64(3), got["contracts"])
+	assert.Equal(t, float64(1), got["failed"])
+}
+
+func TestCORSOrigins(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		want    []string
+		wantErr string
+	}{
+		{name: "unset means no CORS"},
+		{name: "one origin", value: "https://app.example.test", want: []string{"https://app.example.test"}},
+		{
+			name:  "a list, with space and a trailing slash",
+			value: " https://app.example.test/ , http://localhost:3000 ",
+			want:  []string{"https://app.example.test", "http://localhost:3000"},
+		},
+		{name: "wildcard", value: "*", want: []string{"*"}},
+		{
+			name:    "wildcard cannot be mixed with a list",
+			value:   "*, https://app.example.test",
+			wantErr: "not both",
+		},
+		{
+			name:    "wildcard after a list",
+			value:   "https://app.example.test, *",
+			wantErr: "not both",
+		},
+		{
+			name:    "not an origin",
+			value:   "not a url",
+			wantErr: "CORS_ORIGINS",
+		},
+		{
+			name:    "only http and https",
+			value:   "ftp://app.example.test",
+			wantErr: "http or https",
+		},
+		{
+			name:    "a path is not an origin",
+			value:   "https://app.example.test/api",
+			wantErr: "must be an origin",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vars := map[string]string{"DATABASE_URL": testDatabaseURL}
+			if tt.value != "" {
+				vars["CORS_ORIGINS"] = tt.value
+			}
+			setEnv(t, vars)
+
+			cfg, err := config.Load()
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, cfg.CORSOrigins)
+		})
+	}
+}
+
+func TestRateLimit(t *testing.T) {
+	tests := []struct {
+		name    string
+		vars    map[string]string
+		want    int
+		wantErr string
+	}{
+		{name: "defaults", want: config.DefaultRateLimitPerMinute},
+		{name: "a configured limit", vars: map[string]string{"RATE_LIMIT_PER_MINUTE": "120"}, want: 120},
+		{name: "zero is not a limit", vars: map[string]string{"RATE_LIMIT_PER_MINUTE": "0"}, wantErr: "between"},
+		{name: "not a number", vars: map[string]string{"RATE_LIMIT_PER_MINUTE": "lots"}, wantErr: "RATE_LIMIT_PER_MINUTE"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vars := map[string]string{"DATABASE_URL": testDatabaseURL}
+			for k, v := range tt.vars {
+				vars[k] = v
+			}
+			setEnv(t, vars)
+
+			cfg, err := config.Load()
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, cfg.RateLimitPerMinute)
+		})
+	}
+
+	t.Run("burst", func(t *testing.T) {
+		setEnv(t, map[string]string{
+			"DATABASE_URL":          testDatabaseURL,
+			"RATE_LIMIT_BURST":      "5",
+			"TRUST_X_FORWARDED_FOR": "true",
+		})
+
+		cfg, err := config.Load()
+		require.NoError(t, err)
+		assert.Equal(t, 5, cfg.RateLimitBurst)
+		assert.True(t, cfg.TrustXForwardedFor)
+	})
+
+	t.Run("read-only", func(t *testing.T) {
+		setEnv(t, map[string]string{
+			"DATABASE_URL": testDatabaseURL,
+			"READ_ONLY":    "true",
+		})
+
+		cfg, err := config.Load()
+		require.NoError(t, err)
+		assert.True(t, cfg.ReadOnly)
+	})
+
+	t.Run("invalid read-only boolean", func(t *testing.T) {
+		setEnv(t, map[string]string{
+			"DATABASE_URL": testDatabaseURL,
+			"READ_ONLY":    "sometimes",
+		})
+
+		_, err := config.Load()
+		require.Error(t, err)
+	})
+
+	t.Run("invalid burst and boolean", func(t *testing.T) {
+		for _, vars := range []map[string]string{
+			{"RATE_LIMIT_BURST": "0"},
+			{"RATE_LIMIT_BURST": "many"},
+			{"TRUST_X_FORWARDED_FOR": "sometimes"},
+		} {
+			env := map[string]string{"DATABASE_URL": testDatabaseURL}
+			for k, v := range vars {
+				env[k] = v
+			}
+			setEnv(t, env)
+
+			_, err := config.Load()
+			require.Error(t, err)
+		}
+	})
+}
+
+func TestParseAPITokens(t *testing.T) {
+	t.Parallel()
+
+	t.Run("several tokens for rotation", func(t *testing.T) {
+		tokens, err := config.ParseAPITokens("0123456789abcdef-aaa , 0987654321fedcba-bbb ,0123456789abcdef-ccc")
+		require.NoError(t, err)
+		assert.Equal(t, []string{
+			"0123456789abcdef-aaa", "0987654321fedcba-bbb", "0123456789abcdef-ccc",
+		}, tokens, "entries are trimmed but a token's own bytes are kept")
+	})
+
+	t.Run("empty keeps writes public", func(t *testing.T) {
+		for _, raw := range []string{"", "  "} {
+			tokens, err := config.ParseAPITokens(raw)
+			require.NoError(t, err)
+			assert.Empty(t, tokens)
+		}
+	})
+
+	t.Run("mistakes refuse to boot", func(t *testing.T) {
+		for name, raw := range map[string]string{
+			"too short":  "short",
+			"duplicate":  "0123456789abcdef-aaa, 0123456789abcdef-aaa",
+			"a space in": "0123456789abcdef-aaa bbb",
+		} {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+
+				_, err := config.ParseAPITokens(raw)
+				require.Error(t, err)
+			})
+		}
+	})
+}
+
+func TestLoadAPITokens(t *testing.T) {
+	setEnv(t, map[string]string{
+		"DATABASE_URL": testDatabaseURL,
+		"API_TOKENS":   "0123456789abcdef-aaa,0987654321fedcba-bbb",
+	})
+
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	assert.Equal(t, []string{"0123456789abcdef-aaa", "0987654321fedcba-bbb"}, cfg.APITokens)
+}
+
+// writeConfigFile is a YAML file the tests load through LoadWith.
+func writeConfigFile(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "sorovault.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+	return path
+}
+
+func TestLoadWithConfigFile(t *testing.T) {
+	// The environment is cleared to the test set; a file value must
+	// therefore surface everywhere the environment is silent.
+	setEnv(t, map[string]string{"DATABASE_URL": testDatabaseURL})
+
+	yaml := writeConfigFile(t, `# a reviewed settings file
+http_addr: ":9999"
+LOG_LEVEL: debug
+read_only: true
+rpc_timeout: 5s
+database_max_conns: 8
+max_concurrent_registrations: 2
+rate_limit_per_minute: 60
+refresh_webhook_url: "https://example.com/trapdoor"      # a comment
+tls_cert_file: "/etc/sorovault/tls.crt"
+tls_key_file: "/etc/sorovault/tls.key"
+`)
+
+	cfg, err := config.LoadWith(yaml)
+	require.NoError(t, err)
+	assert.Equal(t, ":9999", cfg.HTTPAddr)
+	assert.Equal(t, slog.LevelDebug, cfg.LogLevel)
+	assert.True(t, cfg.ReadOnly)
+	assert.Equal(t, 5*time.Second, cfg.RPCTimeout)
+	assert.Equal(t, int32(8), cfg.DatabaseMaxConns)
+	assert.Equal(t, 2, cfg.MaxConcurrentRegistrations)
+	assert.Equal(t, 60, cfg.RateLimitPerMinute)
+	assert.Equal(t, "https://example.com/trapdoor", cfg.RefreshWebhookURL)
+	assert.Equal(t, "/etc/sorovault/tls.crt", cfg.TLSCertFile)
+	assert.Equal(t, "/etc/sorovault/tls.key", cfg.TLSKeyFile)
+	assert.Equal(t, testDatabaseURL, cfg.DatabaseURL)
+
+	// The environment overrides the file, setting by setting; a name the
+	// file leaves alone keeps its default.
+	path := writeConfigFile(t, "http_addr: \":9999\"\nlog_level: warn\n")
+	cfg, err = config.LoadWith(path)
+	require.NoError(t, err)
+	assert.Equal(t, slog.LevelWarn, cfg.LogLevel, "a name the file sets alone still applies")
+}
+
+func TestConfigFileUnderEnvironment(t *testing.T) {
+	yaml := writeConfigFile(t, "http_addr: \":9999\"\nread_only: true\n")
+	setEnv(t, map[string]string{
+		"DATABASE_URL": testDatabaseURL,
+		"HTTP_ADDR":    ":7000",
+	})
+
+	// The environment has spoken for HTTP_ADDR; the file still speaks for
+	// every name the environment left alone.
+	cfg, err := config.LoadWith(yaml)
+	require.NoError(t, err)
+	assert.Equal(t, ":7000", cfg.HTTPAddr)
+	assert.True(t, cfg.ReadOnly)
+}
+
+func TestConfigFileMistakes(t *testing.T) {
+	tests := []struct {
+		name    string
+		file    string
+		wantErr string
+	}{
+		{
+			name:    "unknown key",
+			file:    "not_a_setting: true\n",
+			wantErr: "unknown key \"not_a_setting\"",
+		},
+		{
+			name:    "nested map under a known key",
+			file:    "http_addr:\n  nested: 1\n",
+			wantErr: "holds a nested map",
+		},
+		{
+			name:    "list value",
+			file:    "api_tokens:\n  - one\n  - two\n",
+			wantErr: "holds a list",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			path := writeConfigFile(t, tt.file)
+			_, err := config.LoadWith(path)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
 func TestInvalidValues(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -230,6 +771,11 @@ func TestInvalidValues(t *testing.T) {
 			name:    "unknown log level",
 			vars:    map[string]string{"DATABASE_URL": testDatabaseURL, "LOG_LEVEL": "chatty"},
 			wantErr: "unknown LOG_LEVEL",
+		},
+		{
+			name:    "unknown log format",
+			vars:    map[string]string{"DATABASE_URL": testDatabaseURL, "LOG_FORMAT": "xml"},
+			wantErr: "unknown LOG_FORMAT",
 		},
 		{
 			name:    "unparseable timeout",
@@ -320,4 +866,86 @@ func TestLoadDatabaseURLFromFile(t *testing.T) {
 		assert.NotContains(t, err.Error(), testDatabaseURL)
 		assert.Contains(t, err.Error(), f)
 	})
+}
+
+func TestLoadEvents(t *testing.T) {
+	t.Run("off by default, with the default interval", func(t *testing.T) {
+		setEnv(t, map[string]string{"DATABASE_URL": testDatabaseURL})
+		cfg, err := config.Load()
+		require.NoError(t, err)
+		assert.False(t, cfg.RefreshEvents)
+		assert.Equal(t, config.DefaultRefreshEventsInterval, cfg.RefreshEventsInterval)
+	})
+
+	t.Run("on, beside polling", func(t *testing.T) {
+		setEnv(t, map[string]string{
+			"DATABASE_URL": testDatabaseURL, "REFRESH_INTERVAL": "1h",
+			"REFRESH_EVENTS": "true", "REFRESH_EVENTS_INTERVAL": "3s",
+		})
+		cfg, err := config.Load()
+		require.NoError(t, err)
+		assert.True(t, cfg.RefreshEvents)
+		assert.Equal(t, 3*time.Second, cfg.RefreshEventsInterval)
+	})
+
+	for name, vars := range map[string]map[string]string{
+		"events without the polling safety net": {"REFRESH_EVENTS": "true"},
+		"not a boolean":                         {"REFRESH_EVENTS": "maybe", "REFRESH_INTERVAL": "1h"},
+		"interval too short":                    {"REFRESH_EVENTS_INTERVAL": "100ms"},
+		"interval not a duration":               {"REFRESH_EVENTS_INTERVAL": "soon"},
+	} {
+		t.Run("rejects "+name, func(t *testing.T) {
+			vars["DATABASE_URL"] = testDatabaseURL
+			setEnv(t, vars)
+			_, err := config.Load()
+			assert.Error(t, err)
+		})
+	}
+}
+
+func TestLoadSigning(t *testing.T) {
+	seed := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	retired := base64.StdEncoding.EncodeToString(make([]byte, 32))
+
+	t.Run("no key, no signer", func(t *testing.T) {
+		setEnv(t, map[string]string{"DATABASE_URL": testDatabaseURL})
+		cfg, err := config.Load()
+		require.NoError(t, err)
+		assert.Nil(t, cfg.Signer)
+	})
+
+	t.Run("a key from the environment", func(t *testing.T) {
+		setEnv(t, map[string]string{"DATABASE_URL": testDatabaseURL, "SIGNING_KEY": seed, "SIGNING_RETIRED_KEYS": retired + ", " + retired})
+		cfg, err := config.Load()
+		require.NoError(t, err)
+		require.NotNil(t, cfg.Signer)
+		assert.Len(t, cfg.Signer.KeyID(), 16)
+		assert.Len(t, cfg.RetiredSigningKeys, 2)
+	})
+
+	t.Run("a key from a file, newline and all", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "key")
+		require.NoError(t, os.WriteFile(path, []byte(seed+"\n"), 0o600))
+		setEnv(t, map[string]string{"DATABASE_URL": testDatabaseURL, "SIGNING_KEY_FILE": path})
+		cfg, err := config.Load()
+		require.NoError(t, err)
+		assert.NotNil(t, cfg.Signer)
+	})
+
+	for name, vars := range map[string]map[string]string{
+		"both inline and file": {"SIGNING_KEY": seed, "SIGNING_KEY_FILE": "/nonexistent"},
+		"missing file":         {"SIGNING_KEY_FILE": "/nonexistent/key"},
+		"not base64":           {"SIGNING_KEY": "!!!"},
+		"wrong length":         {"SIGNING_KEY": base64.StdEncoding.EncodeToString([]byte("short"))},
+		"bad retired key":      {"SIGNING_KEY": seed, "SIGNING_RETIRED_KEYS": "AAAA"},
+		"retired without key":  {"SIGNING_RETIRED_KEYS": retired},
+	} {
+		t.Run("rejects "+name, func(t *testing.T) {
+			vars["DATABASE_URL"] = testDatabaseURL
+			setEnv(t, vars)
+			_, err := config.Load()
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), seed, "the key must not leak into an error")
+		})
+	}
 }

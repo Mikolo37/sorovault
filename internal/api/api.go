@@ -2,19 +2,25 @@
 //
 // The API is read-mostly: the only write is registering or refreshing a
 // contract, which does not change the contract itself, only what SoroVault
-// knows about it. There is no authentication — deployment is expected to put
-// the service behind whatever the operator already uses.
+// knows about it. There is no authentication by default — deployment is
+// expected to put the service behind whatever the operator already uses —
+// and when API tokens are configured, write endpoints require a bearer
+// credential while reads stay public.
 package api
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"crypto/sha256"
+	"crypto/subtle"
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -25,7 +31,9 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/soroworks/sorovault/internal/attest"
 	"github.com/soroworks/sorovault/internal/codegen"
+	"github.com/soroworks/sorovault/internal/model"
 	"github.com/soroworks/sorovault/internal/refresher"
 	"github.com/soroworks/sorovault/internal/registry"
 	"github.com/soroworks/sorovault/internal/spec"
@@ -36,14 +44,29 @@ import (
 
 // Server holds the API's dependencies.
 type Server struct {
-	reg   *registry.Registry
-	log   *slog.Logger
-	cache *interfaceCache
+	reg       *registry.Registry
+	log       *slog.Logger
+	cache     *interfaceCache
+	rateLimit *clientLimiter
 
 	// lastSweep, when set, reports the most recent automatic refresh
 	// sweep. It is nil when refresh is disabled, and GET /api/stats then
 	// omits the field.
 	lastSweep func() (refresher.SweepRecord, bool)
+
+	// signer, when set, signs interface responses. keys is every public key
+	// published at GET /api/keys: the signer's, then any retired ones.
+	signer *attest.Signer
+	keys   []attest.Key
+
+	// readOnly marks a mirror that refuses writes. It is read once, when
+	// Routes mounts, so a server's mode is fixed at startup.
+	readOnly bool
+
+	// tokens are the bearer credentials writes must present. Empty keeps
+	// every write public, as the API has always behaved; they are held
+	// here and compared in constant time, and never logged or echoed.
+	tokens []string
 }
 
 // NewServer builds an API server over a registry.
@@ -54,11 +77,47 @@ func NewServer(reg *registry.Registry, log *slog.Logger) *Server {
 	return &Server{reg: reg, log: log, cache: newInterfaceCache(interfaceCacheBytes)}
 }
 
+// SetReadOnly makes the server's write routes refuse with 405 instead of
+// running: reads stay public, and the automatic refresher outside the API
+// keeps the registry current. Call it before Routes mounts the routes,
+// where the choice between a real handler and a refusal is made once. It
+// mirrors SetLastSweep, which serve also sets at startup.
+func (s *Server) SetReadOnly(readOnly bool) {
+	s.readOnly = readOnly
+}
+
+// SetAPITokens requires write routes to present one of the given bearer
+// tokens. Call it before Routes mounts, where the gate is built once.
+// An empty list keeps every write public; values are compared in constant
+// time, and nothing logs or echoes them, matching how the config keeps
+// them out of trouble.
+func (s *Server) SetAPITokens(tokens []string) {
+	s.tokens = tokens
+}
+
 // SetLastSweep makes GET /api/stats report the most recent automatic
 // refresh sweep. Serve calls it when refresh is enabled; without it the
 // field is omitted, which is the honest answer when nothing sweeps.
 func (s *Server) SetLastSweep(fn func() (refresher.SweepRecord, bool)) {
 	s.lastSweep = fn
+}
+
+// SetSigner makes the server attach a detached Ed25519 signature to every
+// interface response, and publish the verification keys at GET /api/keys.
+// retired are earlier public keys that stay published so signatures made
+// before a rotation remain verifiable.
+func (s *Server) SetSigner(signer *attest.Signer, retired ...ed25519.PublicKey) {
+	s.signer = signer
+	s.keys = nil
+	if signer == nil {
+		return
+	}
+	s.keys = append(s.keys, attest.NewKey(signer.PublicKey(), true))
+	for _, pub := range retired {
+		if key := attest.NewKey(pub, false); key.ID != s.keys[0].ID {
+			s.keys = append(s.keys, key)
+		}
+	}
 }
 
 // Routes returns the API's routes, to be mounted under /api.
@@ -67,27 +126,95 @@ func (s *Server) Routes() chi.Router {
 	r.Use(compressResponses("application/json", "text/plain"))
 
 	r.Get("/contracts", s.listContracts)
-	r.Post("/contracts", s.registerContract)
-	r.Post("/contracts:batch", s.batchRegisterContracts)
+	// POST /decode stays available in read-only mode: it answers with the
+	// decoded module and stores nothing, so it is a read with POST form.
+	r.Post("/decode", s.rateLimited(s.decodeWasm))
+	r.Post("/contracts", s.write(s.rateLimited(s.registerContract)))
+	r.Post("/contracts:batch", s.write(s.batchRegisterContracts))
+	r.Get("/wasm/{hash}.wasm", s.getWasmModule)
 	r.Get("/wasm/{hash}", s.getWasmSpec)
-	r.Post("/wasm/{hash}", s.catalogWasm)
+	r.Post("/wasm/{hash}", s.write(s.catalogWasm))
 	r.Get("/wasm/{hash}/contracts", s.listWasmContracts)
 	r.Get("/contracts/{id}", cacheable(s.getContract))
-	r.Put("/contracts/{id}/source", s.updateContractSource)
-	r.Post("/contracts/{id}/refresh", s.refreshContract)
+	r.Put("/contracts/{id}/source", s.write(s.updateContractSource))
+	r.Post("/contracts/{id}/verify", s.write(s.verifyPublisher))
+	r.Put("/contracts/{id}/deprecation", s.write(s.setContractDeprecation))
+	r.Delete("/contracts/{id}/deprecation", s.write(s.clearContractDeprecation))
+	r.Post("/contracts/{id}/refresh", s.write(s.rateLimited(s.refreshContract)))
 	r.Get("/contracts/{id}/versions", s.listVersions)
 	r.Get("/contracts/{id}/functions", s.listFunctions)
+	r.Get("/contracts/{id}/events", s.listEvents)
 	r.Get("/contracts/{id}/functions/{fn}", cacheable(s.getFunction))
 	r.Get("/contracts/{id}/functions/{fn}/schema.json", s.getFunctionSchema)
+	r.Get("/contracts/{id}/functions/{fn}/example.json", s.getFunctionExample)
 	r.Get("/contracts/{id}/client.ts", cacheable(s.getTypeScriptClient))
 	r.Get("/contracts/{id}/client.go", cacheable(s.getGoClient))
 	r.Get("/contracts/{id}/client.py", cacheable(s.getPythonClient))
+	r.Get("/keys", s.getKeys)
 	r.Get("/stats", s.getStats)
 	r.Get("/upgrades", s.listUpgrades)
 	r.Get("/upgrades.atom", s.upgradesAtom)
 	r.Get("/openapi.json", serveOpenAPI)
+	r.Post("/subscriptions", s.write(s.subscribeContract))
+	r.Get("/subscriptions", s.listSubscriptions)
+	r.Delete("/subscriptions/{secret}", s.write(s.unsubscribeContract))
 
 	return r
+}
+
+// write chooses at mount time what a write route does: its real handler in
+// normal operation, or a 405 refusal in read-only mode. The routes stay
+// mounted either way, so a writer hitting a read-only mirror is told the
+// method is refused rather than sent a 404 that reads as an unknown
+// resource.
+func (s *Server) write(h http.HandlerFunc) http.HandlerFunc {
+	if s.readOnly {
+		return func(w http.ResponseWriter, r *http.Request) {
+			writeError(w, http.StatusMethodNotAllowed,
+				"this SoroVault is running read-only; write access is disabled")
+		}
+	}
+	if len(s.tokens) > 0 {
+		return s.requireBearer(h)
+	}
+	return h
+}
+
+// requireBearer serves the wrapped route only when the request presents
+// one of the configured tokens as `Authorization: Bearer <token>`.
+//
+// Malformed credentials and wrong tokens get different status codes — a
+// malformed header is a client mistake worth teaching, while a valid
+// header with the wrong secret is an access attempt and only ever earns
+// "unauthorized", which carries the presented secret nowhere.
+func (s *Server) requireBearer(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !ok {
+			writeError(w, http.StatusBadRequest,
+				"Authorization header must be Bearer authentication")
+			return
+		}
+		if !s.tokenMatches(token) {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="sorovault"`)
+			writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		next(w, r)
+	}
+}
+
+// tokenMatches compares a presented secret against every configured token
+// regardless of any match: the loop runs whole, so success is not told
+// apart from failure by how early it stopped. Every comparison is
+// constant time; lengths differ, subtleties and all, so timing leaks
+// nothing more than the response does.
+func (s *Server) tokenMatches(presented string) bool {
+	matches := 0
+	for _, token := range s.tokens {
+		matches |= subtle.ConstantTimeCompare([]byte(presented), []byte(token))
+	}
+	return matches == 1
 }
 
 var commitHash = regexp.MustCompile(`^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$`)
@@ -120,7 +247,59 @@ func (s *Server) getWasmSpec(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	if s.signer != nil {
+		body, err := json.Marshal(stored.Interface)
+		if err != nil {
+			s.fail(w, r, fmt.Errorf("api: encoding interface for wasm %s: %w", wasmHash, err))
+			return
+		}
+		s.attest(w, r, attest.Statement{
+			Network: stored.Network, WasmHash: stored.WasmHash, Interface: body,
+		})
+	}
 	writeJSON(w, http.StatusOK, stored)
+}
+
+// getWasmModule serves GET /api/wasm/{hash}.wasm: the uploaded module
+// itself, fetched from the configured network and verified against the hash
+// in the URL. Because the URL is content-addressed, the response is
+// immutable and safe to cache for as long as a client likes.
+//
+// The bytes are not stored by SoroVault — the chain remains the source of
+// truth — so ?network, when given, must name the network this instance is
+// pointed at. Serving another network's bytes under this hash would defeat
+// the verification the hash is meant to provide.
+func (s *Server) getWasmModule(w http.ResponseWriter, r *http.Request) {
+	wasmHash, err := parseWasmHash(chi.URLParam(r, "hash"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid wasm hash")
+		return
+	}
+
+	network, err := s.reg.Network(r.Context())
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	if requested := strings.TrimSpace(r.URL.Query().Get("network")); requested != "" && stellar.NetworkName(requested) != network {
+		writeError(w, http.StatusBadRequest,
+			"this SoroVault fetches modules from the "+stellar.NetworkLogLabel(network)+" network")
+		return
+	}
+
+	module, err := s.reg.Wasm(r.Context(), wasmHash)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/wasm")
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	w.Header().Set("Content-Length", strconv.Itoa(len(module)))
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(module); err != nil {
+		s.log.DebugContext(r.Context(), "writing wasm module", "wasm_hash", wasmHash, "error", err)
+	}
 }
 
 // listWasmContracts serves GET /api/wasm/{hash}/contracts.
@@ -183,6 +362,126 @@ func (s *Server) catalogWasm(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, result)
 }
 
+// maxDecodeBody caps an uploaded module at 512 KiB — four times the 128 KiB
+// the network allows as contract code, so any module that could ever run on
+// chain fits. It stays deliberately small because this is the only endpoint
+// that reads an arbitrary blob, and each concurrent upload is held in full:
+// until per-client rate limiting exists, the body limit is what bounds
+// memory under a flood of requests.
+const maxDecodeBody = 512 << 10
+
+// errDecodeTooLarge reports an upload beyond maxDecodeBody, so the handler
+// can answer 413 instead of the 400 every other malformed body earns.
+var errDecodeTooLarge = fmt.Errorf("request body exceeds the %d-byte limit", maxDecodeBody)
+
+// decodeWasm serves POST /api/decode: it decodes an uploaded WASM module
+// and returns its interface, without storing anything. The endpoint touches
+// neither the network nor the database, and reuses spec.XDRDecoder — the
+// same decoder every other path goes through, so its limits apply here
+// unchanged.
+//
+// The body is either the raw module, whatever the content type, or a
+// multipart/form-data upload whose first file part carries it. ?format=ts
+// answers with the TypeScript client for the interface instead of the ABI
+// JSON.
+func (s *Server) decodeWasm(w http.ResponseWriter, r *http.Request) {
+	format := r.URL.Query().Get("format")
+	if format != "" && format != "json" && format != "ts" {
+		writeError(w, http.StatusBadRequest, "format must be \"json\" or \"ts\"")
+		return
+	}
+
+	module, err := readWasmBody(r, maxDecodeBody)
+	switch {
+	case errors.Is(err, errDecodeTooLarge):
+		writeError(w, http.StatusRequestEntityTooLarge, err.Error())
+		return
+	case err != nil:
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Every decoder failure is a property of the upload — an unparseable
+	// module, a missing spec section, an entry stream that does not
+	// convert — never a server fault, so none of it becomes a 500.
+	var decoder spec.XDRDecoder
+	iface, err := decoder.Decode(module)
+	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+
+	if format == "ts" {
+		// There is no contract ID or network yet — the module is not
+		// deployed — so only the hash, derived from the bytes at hand,
+		// identifies the interface version the client was built from.
+		sum := sha256.Sum256(module)
+		source, err := codegen.TypeScript(iface, codegen.Source{
+			WasmHash: hex.EncodeToString(sum[:]),
+		})
+		if err != nil {
+			writeError(w, http.StatusUnprocessableEntity, err.Error())
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte(source))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, iface)
+}
+
+// readWasmBody reads the uploaded module from r: a raw body, or the first
+// file part of a multipart/form-data upload. It rejects an empty body and
+// anything larger than limit, which is enforced as the bytes arrive, so an
+// oversized upload is never held in full.
+func readWasmBody(r *http.Request, limit int) ([]byte, error) {
+	var body io.Reader = r.Body
+
+	if mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err == nil && mediaType == "multipart/form-data" {
+		file, err := multipartWasmFile(r)
+		if err != nil {
+			return nil, err
+		}
+		body = file
+	}
+
+	module, err := io.ReadAll(io.LimitReader(body, int64(limit)+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading request body: %w", err)
+	}
+	if len(module) > limit {
+		return nil, errDecodeTooLarge
+	}
+	if len(module) == 0 {
+		return nil, errors.New("request body is empty")
+	}
+	return module, nil
+}
+
+// multipartWasmFile returns the first file part of a multipart upload — the
+// part a browser or curl calls a file. Plain fields are skipped, so a form
+// carrying no file is refused rather than decoded as if its field names
+// were a WASM module.
+func multipartWasmFile(r *http.Request) (io.Reader, error) {
+	mr, err := r.MultipartReader()
+	if err != nil {
+		return nil, fmt.Errorf("invalid multipart body: %w", err)
+	}
+	for {
+		part, err := mr.NextPart()
+		if errors.Is(err, io.EOF) {
+			return nil, errors.New("multipart body contains no file part")
+		}
+		if err != nil {
+			return nil, fmt.Errorf("invalid multipart body: %w", err)
+		}
+		if part.FileName() != "" {
+			return part, nil
+		}
+	}
+}
+
 func (s *Server) updateContractSource(w http.ResponseWriter, r *http.Request) {
 	var req sourceRequest
 	if err := decodeJSON(r, &req); err != nil {
@@ -207,6 +506,133 @@ func (s *Server) updateContractSource(w http.ResponseWriter, r *http.Request) {
 	}
 	contractID := chi.URLParam(r, "id")
 	if err := s.reg.Store().UpdateSource(r.Context(), network, contractID, sourceURL, commit); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	contract, err := s.reg.Store().GetContract(r.Context(), network, contractID)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, contract)
+}
+
+// attest attaches a detached signature over the statement to the response.
+//
+// A signing failure leaves the response unsigned and logs it: the data is
+// still right, and a client that requires a signature will notice it is
+// missing and refuse the response, which is what the signature is for.
+func (s *Server) attest(w http.ResponseWriter, r *http.Request, st attest.Statement) {
+	if s.signer == nil {
+		return
+	}
+	sig, err := s.signer.Sign(st)
+	if err != nil {
+		s.log.ErrorContext(r.Context(), "signing interface response failed")
+		return
+	}
+	w.Header().Set(attest.SignatureHeader, sig)
+	w.Header().Set(attest.KeyIDHeader, s.signer.KeyID())
+}
+
+// getKeys serves GET /api/keys: the public keys interface signatures verify
+// against. The list is empty when the registry does not sign.
+func (s *Server) getKeys(w http.ResponseWriter, _ *http.Request) {
+	keys := s.keys
+	if keys == nil {
+		keys = []attest.Key{}
+	}
+	writeJSON(w, http.StatusOK, keysResponse{Keys: keys})
+}
+
+// verifyPublisher serves POST /api/contracts/{id}/verify.
+//
+// The body is a claim signed by the account that deployed the contract; see
+// registry.VerifyPublisher for what makes one acceptable. Nothing else
+// authenticates the caller, because the signature is the authentication.
+func (s *Server) verifyPublisher(w http.ResponseWriter, r *http.Request) {
+	var req verifyRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.Claim.ContractID != chi.URLParam(r, "id") {
+		writeError(w, http.StatusBadRequest, "claim.contract_id does not match the contract in the URL")
+		return
+	}
+
+	contract, err := s.reg.VerifyPublisher(r.Context(), registry.PublisherClaim{
+		Claim:     req.Claim,
+		Signer:    strings.TrimSpace(req.Signer),
+		Signature: strings.TrimSpace(req.Signature),
+	})
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, contract)
+}
+
+// deprecationRequest is the body of PUT /contracts/{id}/deprecation. Both
+// fields are optional: a contract can be retired without a recorded
+// destination.
+type deprecationRequest struct {
+	Successor string `json:"successor,omitempty"`
+	Note      string `json:"note,omitempty"`
+}
+
+// setContractDeprecation serves PUT
+// /api/contracts/{id}/deprecation: mark a contract deprecated, with an
+// optional successor and note. It answers with the updated contract, the
+// same shape the source endpoint answers with.
+func (s *Server) setContractDeprecation(w http.ResponseWriter, r *http.Request) {
+	var req deprecationRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	network, err := s.network(r)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	contractID := chi.URLParam(r, "id")
+	successor := strings.TrimSpace(req.Successor)
+	if successor == contractID {
+		writeError(w, http.StatusBadRequest,
+			"the successor must be a contract other than the one being deprecated")
+		return
+	}
+	if successor != "" {
+		if _, err := s.reg.Store().GetContract(r.Context(), network, successor); err != nil {
+			writeError(w, http.StatusBadRequest, "successor "+successor+" is not registered on "+network)
+			return
+		}
+	}
+	if err := s.reg.Store().SetDeprecation(r.Context(), network, contractID, successor,
+		strings.TrimSpace(req.Note)); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	contract, err := s.reg.Store().GetContract(r.Context(), network, contractID)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, contract)
+}
+
+// clearContractDeprecation serves DELETE
+// /api/contracts/{id}/deprecation: lift the mark, restoring the contract
+// to active use.
+func (s *Server) clearContractDeprecation(w http.ResponseWriter, r *http.Request) {
+	network, err := s.network(r)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	contractID := chi.URLParam(r, "id")
+	if err := s.reg.Store().ClearDeprecation(r.Context(), network, contractID); err != nil {
 		s.fail(w, r, err)
 		return
 	}
@@ -249,10 +675,24 @@ func (s *Server) getTypeScriptClient(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var deprecation *codegen.Deprecation
+	if contract, err := s.reg.Store().GetContract(r.Context(), network, contractID); err == nil && contract.DeprecatedSince != nil {
+		// The client is generated from the interface, but the mark is
+		// on the contract: a generated file exported today should warn
+		// its importer about a migration that happened last week.
+		deprecation = &codegen.Deprecation{
+			Since:     contract.DeprecatedSince.UTC().Format(time.RFC3339),
+			Successor: contract.Successor,
+			Note:      contract.DeprecationNote,
+		}
+	}
+
 	source, err := codegen.TypeScript(stored.Interface, codegen.Source{
-		ContractID: stored.ContractID,
-		Network:    stored.Network,
-		WasmHash:   stored.WasmHash,
+		ContractID:  stored.ContractID,
+		Network:     stored.Network,
+		WasmHash:    stored.WasmHash,
+		Deprecation: deprecation,
+		WithZod:     r.URL.Query().Get("zod") != "",
 	})
 	if err != nil {
 		// The interface decoded, but cannot be expressed as TypeScript —
@@ -534,9 +974,22 @@ func copyHeader(dst, src http.Header) {
 func Middleware(log *slog.Logger) []func(http.Handler) http.Handler {
 	return []func(http.Handler) http.Handler{
 		middleware.RequestID,
+		requestIDHeader,
 		middleware.Recoverer,
 		requestLogger(log),
 	}
+}
+
+// requestIDHeader copies the request ID onto the response, so a client can
+// quote it when reporting a problem. The ID itself is assigned by
+// middleware.RequestID.
+func requestIDHeader(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if id := middleware.GetReqID(r.Context()); id != "" {
+			w.Header().Set(middleware.RequestIDHeader, id)
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // getStats serves GET /api/stats.
@@ -552,6 +1005,7 @@ func (s *Server) getStats(w http.ResponseWriter, r *http.Request) {
 		Contracts:      stats.Contracts,
 		Versions:       stats.Versions,
 		LatestContract: stats.Latest,
+		ReadOnly:       s.readOnly,
 	}
 	if s.lastSweep != nil {
 		if record, ok := s.lastSweep(); ok {
@@ -593,18 +1047,32 @@ func (s *Server) listUpgrades(w http.ResponseWriter, r *http.Request) {
 }
 
 // listContracts serves GET /api/contracts.
+//
+// Paging is either by cursor or by the deprecated offset. A cursor names the
+// last row of the previous page, so rows added while a client pages through
+// the listing are seen exactly once — which is the property offsets lose.
 func (s *Server) listContracts(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
+
+	cursor := q.Get("cursor")
+	offset := intParam(q.Get("offset"), 0)
+	if cursor != "" && offset != 0 {
+		writeError(w, http.StatusBadRequest,
+			"give a cursor or an offset, not both; offset is deprecated, so prefer the cursor")
+		return
+	}
 
 	filter := store.ListFilter{
 		Network: q.Get("network"),
 		Query:   q.Get("q"),
 		// The exact-name filters are repeatable, and every one of them has
 		// to match.
-		Functions: q["function"],
-		Types:     q["type"],
-		Limit:     intParam(q.Get("limit"), 0),
-		Offset:    intParam(q.Get("offset"), 0),
+		Functions:  q["function"],
+		Types:      q["type"],
+		Implements: q["implements"],
+		Limit:      intParam(q.Get("limit"), 0),
+		Offset:     offset,
+		Cursor:     cursor,
 	}
 	filter.Normalize()
 
@@ -619,13 +1087,15 @@ func (s *Server) listContracts(w http.ResponseWriter, r *http.Request) {
 		Total:     page.Total,
 		Limit:     filter.Limit,
 		Offset:    filter.Offset,
+		Next:      page.Next,
 	})
 }
 
 // getContract serves GET /api/contracts/{id}, returning the decoded ABI.
 //
 // The optional wasm_hash parameter selects a superseded version; without it
-// the contract's current interface is returned.
+// the contract's current interface is returned. ?download=1 asks the browser
+// to save the document under a name of its own rather than display it.
 func (s *Server) getContract(w http.ResponseWriter, r *http.Request) {
 	contractID := chi.URLParam(r, "id")
 
@@ -664,19 +1134,60 @@ func (s *Server) getContract(w http.ResponseWriter, r *http.Request) {
 		s.cache.add(key, cached)
 	}
 
+	// The header has to be set before the body is written.
+	if r.URL.Query().Get("download") != "" {
+		w.Header().Set("Content-Disposition", `attachment; filename="`+ABIFilename(contractID, cacheHash)+`"`)
+	}
+
+	builtin := cacheHash == stellar.BuiltinSACIdentifier
+	responseHash := cacheHash
+	interfaceID := ""
+	if builtin {
+		responseHash = ""
+		interfaceID = stellar.BuiltinSACIdentifier
+	}
+	s.attest(w, r, attest.Statement{
+		Network: contract.Network, ContractID: contract.ContractID,
+		WasmHash: cacheHash, Interface: cached.body,
+	})
 	writeJSON(w, http.StatusOK, contractResponse{
 		ContractID:   contract.ContractID,
 		Network:      contract.Network,
-		WasmHash:     cacheHash,
+		WasmHash:     responseHash,
+		InterfaceID:  interfaceID,
+		Builtin:      builtin,
 		Name:         contract.Name,
+		Implements:   contract.Implements,
 		SourceURL:    contract.SourceURL,
 		SourceCommit: contract.SourceCommit,
 		FirstSeen:    contract.FirstSeen.UTC(),
 		DecodedAt:    cached.decodedAt,
 		MissingSince: contract.MissingSince,
+		Origin:       originOf(*contract),
+		Verified:     verifiedOf(*contract),
 		Current:      cacheHash == contract.CurrentWasmHash,
 		Interface:    json.RawMessage(cached.body),
 	})
+}
+
+// ABIFilename names the file a downloaded interface is saved as: the contract
+// it belongs to, and the short form of the WASM hash it was decoded from, so
+// two versions of one contract do not collide.
+//
+// The browse page names the file the same way, so the two cannot disagree
+// about what a download will be called.
+func ABIFilename(contractID, wasmHash string) string {
+	return contractID + "." + shortHash(wasmHash) + ".abi.json"
+}
+
+// shortHash is the head of a WASM hash: enough to tell two versions of a
+// contract apart, short enough for a filename.
+func shortHash(hash string) string {
+	const n = 12
+	if len(hash) <= n {
+		return hash
+	}
+	return hash[:n]
 }
 
 // getFunction serves GET /api/contracts/{id}/functions/{fn}.
@@ -704,12 +1215,19 @@ func (s *Server) getFunction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	wasmHash, interfaceID := stored.WasmHash, ""
+	if stored.Interface.Builtin {
+		wasmHash = ""
+		interfaceID = stored.WasmHash
+	}
 	writeJSON(w, http.StatusOK, functionResponse{
-		ContractID: stored.ContractID,
-		Network:    stored.Network,
-		WasmHash:   stored.WasmHash,
-		Signature:  fn.Signature(),
-		Function:   fn,
+		ContractID:  stored.ContractID,
+		Network:     stored.Network,
+		WasmHash:    wasmHash,
+		InterfaceID: interfaceID,
+		Builtin:     stored.Interface.Builtin,
+		Signature:   fn.Signature(),
+		Function:    fn,
 	})
 }
 
@@ -759,6 +1277,52 @@ func (s *Server) getFunctionSchema(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(schema) //nolint:gosec // generated JSON Schema, served as application/schema+json
 }
 
+// getFunctionExample serves GET
+// /api/contracts/{id}/functions/{fn}/example.json: one example argument list
+// for the function.
+//
+// The document is the placeholder argument object the function's JSON Schema
+// validates, so a client can take it, fill in the fields it cares about and
+// send its first request. It is derived from the same stored interface the
+// schema is, which keeps the two from drifting apart.
+func (s *Server) getFunctionExample(w http.ResponseWriter, r *http.Request) {
+	contractID := chi.URLParam(r, "id")
+	fnName := chi.URLParam(r, "fn")
+
+	network, err := s.network(r)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+
+	wasmHash := strings.TrimSpace(r.URL.Query().Get("wasm_hash"))
+	stored, err := s.reg.Store().GetSpec(r.Context(), network, contractID, wasmHash)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+
+	fn, ok := stored.Interface.Function(fnName)
+	if !ok {
+		writeError(w, http.StatusNotFound,
+			"no function "+strconv.Quote(fnName)+" in contract "+contractID)
+		return
+	}
+
+	example, err := codegen.Example(stored.Interface, fn, codegen.Source{
+		ContractID: stored.ContractID,
+		Network:    stored.Network,
+		WasmHash:   stored.WasmHash,
+	})
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(example) //nolint:gosec // generated example, served as application/json
+}
+
 // listFunctions serves GET /api/contracts/{id}/functions.
 func (s *Server) listFunctions(w http.ResponseWriter, r *http.Request) {
 	contractID := chi.URLParam(r, "id")
@@ -784,11 +1348,59 @@ func (s *Server) listFunctions(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	wasmHash, interfaceID := stored.WasmHash, ""
+	if stored.Interface.Builtin {
+		wasmHash = ""
+		interfaceID = stored.WasmHash
+	}
 	writeJSON(w, http.StatusOK, functionListResponse{
+		ContractID:  stored.ContractID,
+		Network:     stored.Network,
+		WasmHash:    wasmHash,
+		InterfaceID: interfaceID,
+		Builtin:     stored.Interface.Builtin,
+		Functions:   functions,
+	})
+}
+
+// listEvents serves GET /api/contracts/{id}/events: the event definitions a
+// contract declares, for the indexers that react to them.
+//
+// An indexer usually wants only the events and not the whole interface, which
+// is one large document. Each event is the definition the interface holds
+// itself — its name, topic names, parameters with their types and whether
+// each is a topic or data, and the data payload's packing — so values here
+// match the ones the interface document serves, `?wasm_hash=` selects a
+// superseded version the same way, and the shapes stay in step by
+// construction.
+func (s *Server) listEvents(w http.ResponseWriter, r *http.Request) {
+	contractID := chi.URLParam(r, "id")
+
+	network, err := s.network(r)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+
+	wasmHash := strings.TrimSpace(r.URL.Query().Get("wasm_hash"))
+	stored, err := s.reg.Store().GetSpec(r.Context(), network, contractID, wasmHash)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+
+	events := stored.Interface.Events
+	if events == nil {
+		// A contract with no events still answers with an empty list,
+		// the way the interface document answers with [].
+		events = []model.Event{}
+	}
+
+	writeJSON(w, http.StatusOK, eventListResponse{
 		ContractID: stored.ContractID,
 		Network:    stored.Network,
 		WasmHash:   stored.WasmHash,
-		Functions:  functions,
+		Events:     events,
 	})
 }
 
@@ -951,6 +1563,97 @@ func (s *Server) network(r *http.Request) (string, error) {
 	return s.reg.Network(r.Context())
 }
 
+// subscribeRequest is the request body for creating a subscription.
+type subscribeRequest struct {
+	ContractIDs []string `json:"contract_ids"`
+	URL         string   `json:"url"`
+}
+
+// subscribeResponse is the response for subscription operations.
+type subscribeResponse struct {
+	ID        string `json:"id"`
+	Network   string `json:"network"`
+	Contracts int    `json:"contracts"`
+	Active    bool   `json:"active"`
+}
+
+// subscriptionListResponse is the response for listing subscriptions.
+type subscriptionListResponse struct {
+	Subscriptions []store.SubscriptionListItem `json:"subscriptions"`
+}
+
+// subscribeContract serves POST /api/subscriptions.
+// Registers a webhook URL for a set of contracts, returning a secret used
+// to sign deliveries.
+func (s *Server) subscribeContract(w http.ResponseWriter, r *http.Request) {
+	var req subscribeRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := validateSubscription(req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	net, _ := s.network(r)
+	secret, err := s.reg.Store().Subscribe(r.Context(), net, req.ContractIDs, req.URL)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, subscribeResponse{
+		ID:        secret,
+		Network:   net,
+		Contracts: len(req.ContractIDs),
+		Active:    true,
+	})
+}
+
+// listSubscriptions serves GET /api/subscriptions.
+// Lists all subscriptions.
+func (s *Server) listSubscriptions(w http.ResponseWriter, r *http.Request) {
+	items, err := s.reg.Store().ListSubscriptions(r.Context())
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	// A subscription's ID is the secret that signs its deliveries and
+	// deletes it, so a public listing must not reveal it.
+	for i := range items {
+		items[i].ID = ""
+	}
+
+	writeJSON(w, http.StatusOK, subscriptionListResponse{
+		Subscriptions: items,
+	})
+}
+
+// unsubscribeContract serves DELETE /api/subscriptions.
+// Removes a subscription by its secret.
+func (s *Server) unsubscribeContract(w http.ResponseWriter, r *http.Request) {
+	net, _ := s.network(r)
+	secret := chi.URLParam(r, "secret")
+	if secret == "" {
+		writeError(w, http.StatusBadRequest, "secret is required")
+		return
+	}
+
+	err := s.reg.Store().Unsubscribe(r.Context(), secret)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, subscribeResponse{
+		ID:        secret,
+		Network:   net,
+		Contracts: 0,
+		Active:    false,
+	})
+}
+
 // fail maps a domain error onto a status code and writes it.
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 	if ctxErr := r.Context().Err(); ctxErr != nil && errors.Is(err, ctxErr) {
@@ -972,6 +1675,11 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 // failure cannot leak a connection string or query text to a caller.
 func (s *Server) errorStatus(r *http.Request, err error) (int, string) {
 	switch {
+	case errors.Is(err, store.ErrMalformedCursor):
+		// A cursor is a client-typed string; an unreadable one is the
+		// caller's mistake, not the server's.
+		return http.StatusBadRequest, err.Error()
+
 	case errors.Is(err, store.ErrNotFound), errors.Is(err, stellar.ErrContractNotFound), errors.Is(err, stellar.ErrWasmNotFound):
 		return http.StatusNotFound, err.Error()
 
@@ -993,12 +1701,20 @@ func (s *Server) errorStatus(r *http.Request, err error) (int, string) {
 	case errors.Is(err, registry.ErrBusy):
 		return http.StatusServiceUnavailable, err.Error()
 
+	case errors.Is(err, registry.ErrInvalidClaim):
+		return http.StatusBadRequest, err.Error()
+
+	case errors.Is(err, registry.ErrNotDeployer):
+		return http.StatusForbidden, err.Error()
+
+	case errors.Is(err, registry.ErrStaleClaim), errors.Is(err, registry.ErrDeployerUnknown):
+		return http.StatusUnprocessableEntity, err.Error()
+
 	case isBadContractID(err), errors.Is(err, registry.ErrInvalidWasmHash):
 		return http.StatusBadRequest, err.Error()
 
 	default:
-		s.log.ErrorContext(r.Context(), "request failed",
-			"path", r.URL.Path, "method", r.Method, "error", err)
+		s.log.ErrorContext(r.Context(), "request failed")
 		return http.StatusInternalServerError, "internal error"
 	}
 }
@@ -1041,4 +1757,29 @@ func retryAfterSeconds(d time.Duration) int {
 		seconds = 1
 	}
 	return seconds
+}
+
+// maxSubscriptionContracts bounds how many contracts one subscription covers.
+const maxSubscriptionContracts = 20
+
+// validateSubscription checks a subscription request before anything is
+// stored: at least one well-formed contract ID, and an absolute HTTP(S)
+// webhook URL.
+func validateSubscription(req subscribeRequest) error {
+	if len(req.ContractIDs) == 0 {
+		return errors.New("contract_ids must name at least one contract")
+	}
+	if len(req.ContractIDs) > maxSubscriptionContracts {
+		return fmt.Errorf("contract_ids may name at most %d contracts", maxSubscriptionContracts)
+	}
+	for _, id := range req.ContractIDs {
+		if err := stellar.ValidateContractID(id); err != nil {
+			return err
+		}
+	}
+	u, err := url.Parse(req.URL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return errors.New("url must be an absolute http or https URL")
+	}
+	return nil
 }

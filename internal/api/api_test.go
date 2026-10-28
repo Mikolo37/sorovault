@@ -18,6 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/soroworks/sorovault/internal/api"
+	"github.com/soroworks/sorovault/internal/model"
 	"github.com/soroworks/sorovault/internal/registry"
 	"github.com/soroworks/sorovault/internal/spec"
 	"github.com/soroworks/sorovault/internal/stellar/stellartest"
@@ -51,12 +52,45 @@ func newHarnessWith(t *testing.T, opts registry.Options) *harness {
 	return newHarnessWithOptions(t, stellartest.New(), store.NewMemory(), opts)
 }
 
+// newHarnessWithStore is newHarness with a store of the caller's choosing,
+// so a test can watch what the API does with one.
 func newHarnessWithStore(t *testing.T, fake *stellartest.Fake, db store.Store) *harness {
 	t.Helper()
 
 	return newHarnessWithOptions(t, fake, db, registry.Options{})
 }
 
+// newReadOnlyHarness is newHarness with serve's read-only mode on, set
+// before the routes mount, the way READ_ONLY configures it.
+func newReadOnlyHarness(t *testing.T) *harness {
+	t.Helper()
+
+	return newHarnessWithConfigure(t, func(s *api.Server) { s.SetReadOnly(true) })
+}
+
+// newHarnessWithConfigure builds the default harness with a tweak applied
+// to the API server before its routes mount.
+func newHarnessWithConfigure(t *testing.T, configure func(*api.Server)) *harness {
+	t.Helper()
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	fake := stellartest.New()
+	opts := registry.Options{Logger: log}
+	reg := registry.New(fake, spec.XDRDecoder{}, store.NewMemory(), opts)
+
+	server := api.NewServer(reg, log)
+	configure(server)
+	r := chi.NewRouter()
+	r.Mount("/api", server.Routes())
+
+	srv := httptest.NewServer(r)
+	t.Cleanup(srv.Close)
+
+	return &harness{server: srv, fake: fake, store: reg.Store(), api: server}
+}
+
+// newHarnessWithOptions builds a harness over the given network, store and
+// registry options.
 func newHarnessWithOptions(t *testing.T, fake *stellartest.Fake, db store.Store, opts registry.Options) *harness {
 	t.Helper()
 
@@ -125,6 +159,32 @@ func (h *harness) doWith(t *testing.T, method, path, body, header, value string)
 	if header != "" {
 		req.Header.Set(header, value)
 	}
+
+	resp, err := h.server.Client().Do(req)
+	require.NoError(t, err)
+
+	raw, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	return &response{StatusCode: resp.StatusCode, Header: resp.Header}, raw
+}
+
+// doWithHeader is do with one extra request header, for tests that need
+// credentials beyond JSON bodies.
+func (h *harness) doWithHeader(t *testing.T, method, path, body, key, value string) (*response, []byte) {
+	t.Helper()
+
+	var reader io.Reader
+	if body != "" {
+		reader = strings.NewReader(body)
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), method, h.server.URL+path, reader)
+	require.NoError(t, err)
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set(key, value)
 
 	resp, err := h.server.Client().Do(req)
 	require.NoError(t, err)
@@ -332,6 +392,209 @@ func TestUpdateContractSource(t *testing.T) {
 
 	resp, raw = h.do(t, http.MethodPut, "/api/contracts/"+idB+"/source", body)
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode, string(raw))
+}
+
+func TestContractDeprecation(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.fake.Deploy(idA, moduleWith(t, "balance"))
+	h.fake.Deploy(idB, moduleWith(t, "balance"))
+	resp, _ := h.do(t, http.MethodPost, "/api/contracts", `{"contract_id":"`+idA+`"}`)
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	resp, _ = h.do(t, http.MethodPost, "/api/contracts", `{"contract_id":"`+idB+`"}`)
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+
+	// Mark A deprecated with B as the successor.
+	body := `{"successor":"` + idB + `","note":"Move voting to the replacement."}`
+	resp, raw := h.do(t, http.MethodPut, "/api/contracts/"+idA+"/deprecation", body)
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+	got := h.decode(t, raw)
+	assert.NotEmpty(t, got["deprecated_since"])
+	assert.Equal(t, idB, got["successor"])
+	assert.Equal(t, "Move voting to the replacement.", got["deprecation_note"])
+
+	// The listing carries the mark too.
+	resp, raw = h.do(t, http.MethodGet, "/api/contracts", "")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+	assert.Contains(t, string(raw), "deprecated_since")
+
+	// The generated client warns its importer.
+	resp, raw = h.do(t, http.MethodGet, "/api/contracts/"+idA+"/client.ts", "")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+	assert.Contains(t, string(raw), "// @deprecated since")
+	assert.Contains(t, string(raw), "Use contract "+idB+" instead.")
+
+	// Clearing restores the contract to active use.
+	resp, raw = h.do(t, http.MethodDelete, "/api/contracts/"+idA+"/deprecation", "")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+	got = h.decode(t, raw)
+	assert.Empty(t, got["deprecated_since"])
+	assert.Empty(t, got["successor"])
+	assert.Empty(t, got["deprecation_note"])
+
+	// The generated client no longer warns.
+	resp, raw = h.do(t, http.MethodGet, "/api/contracts/"+idA+"/client.ts", "")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+	assert.NotContains(t, string(raw), "@deprecated")
+}
+
+// TestReadOnlyMode pins what READ_ONLY changes: reads keep answering, the
+// stateless POST /api/decode stays available, and every route that writes
+// answers 405 with an explanation instead of a 404 that would read as an
+// unknown resource.
+func TestReadOnlyMode(t *testing.T) {
+	t.Parallel()
+
+	h := newReadOnlyHarness(t)
+
+	// Reads are untouched.
+	resp, raw := h.do(t, http.MethodGet, "/api/contracts", "")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+
+	resp, raw = h.do(t, http.MethodGet, "/api/stats", "")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+	assert.True(t, h.decode(t, raw)["read_only"].(bool))
+
+	// The decode form is stateless: it stores nothing, so read-only keeps
+	// it.
+	module := moduleWith(t, "proposed")
+	resp, raw = h.do(t, http.MethodPost, "/api/decode", string(module))
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+
+	// Every route that writes is refused where it mounts.
+	hash := strings.Repeat("ab", 32) // syntactically valid, never dereferenced
+	writes := []struct{ method, path string }{
+		{"POST", "/api/contracts"},
+		{"POST", "/api/contracts:batch"},
+		{"POST", "/api/wasm/" + hash},
+		{"PUT", "/api/contracts/" + idA + "/source"},
+		{"PUT", "/api/contracts/" + idA + "/deprecation"},
+		{"DELETE", "/api/contracts/" + idA + "/deprecation"},
+		{"POST", "/api/contracts/" + idA + "/refresh"},
+		{"POST", "/api/subscriptions"},
+		{"DELETE", "/api/subscriptions/somesecret"},
+	}
+	for _, tt := range writes {
+		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
+			t.Parallel()
+
+			resp, raw := h.do(t, tt.method, tt.path, "{}")
+			assert.Equal(t, http.StatusMethodNotAllowed, resp.StatusCode, string(raw))
+			assert.Contains(t, h.decode(t, raw)["error"], "read-only")
+		})
+	}
+}
+
+// TestWriteAuth pins what API_TOKENS changes: reads stay public, writes
+// need a bearer credential, a wrong secret only ever earns "unauthorized"
+// and never echoes the presented value, and every token in the configured
+// set works — which is what makes rotation a configuration change.
+func TestWriteAuth(t *testing.T) {
+	t.Parallel()
+
+	tokens := []string{
+		"0123456789abcdef-dashboards",
+		"0987654321fedcba-ci-runner",
+	}
+	h := newHarnessWithConfigure(t, func(s *api.Server) { s.SetAPITokens(tokens) })
+
+	// Reads are public, including the stateless decode form.
+	resp, raw := h.do(t, http.MethodGet, "/api/contracts", "")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+	resp, raw = h.do(t, http.MethodPost, "/api/decode", string(moduleWith(t, "proposed")))
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+
+	// No credential: teach the client the header shape.
+	resp, raw = h.do(t, http.MethodPost, "/api/contracts", `{"contract_id":"nope"}`)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode, string(raw))
+	assert.Contains(t, h.decode(t, raw)["error"], "Bearer")
+
+	// A well-formed credential with the wrong secret is an access attempt
+	// (401), while a header without a Bearer prefix is a client mistake
+	// worth teaching (400). Neither carries the presented secret back.
+	wrong := []struct {
+		name, value string
+		wantStatus  int
+	}{
+		{"wrong token", "Bearer not-the-configured-secret-ooo", http.StatusUnauthorized},
+		{"lower-case prefix is not Bearer", "bearer " + tokens[0], http.StatusBadRequest},
+	}
+	for _, tt := range wrong {
+		resp, raw = h.doWithHeader(t, http.MethodPost, "/api/contracts",
+			`{"contract_id":"nope"}`, "Authorization", tt.value)
+		require.Equal(t, tt.wantStatus, resp.StatusCode, tt.name)
+		if tt.wantStatus == http.StatusUnauthorized {
+			assert.Equal(t, `Bearer realm="sorovault"`, resp.Header.Get("WWW-Authenticate"), tt.name)
+		}
+		assert.NotContains(t, string(raw), tt.value,
+			"the response never carries the presented secret back")
+	}
+
+	// Every configured token opens the writes — that is the rotation.
+	h.fake.Deploy(idA, moduleWith(t, "balance"))
+	resp, raw = h.doWithHeader(t, http.MethodPost, "/api/contracts",
+		`{"contract_id":"`+idA+`"}`, "Authorization", "Bearer "+tokens[0])
+	require.Equal(t, http.StatusCreated, resp.StatusCode, string(raw))
+
+	resp, raw = h.doWithHeader(t, http.MethodPut, "/api/contracts/"+idA+"/source",
+		`{"source_url":"https://github.com/example/repo"}`, "Authorization", "Bearer "+tokens[1])
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+}
+
+// TestWriteAuthReadOnlyWins pins the composition: a server both read-only
+// and token-gated answers writes with 405, not 401, since no credential
+// can make a refused route run. Reads stay public either way.
+func TestWriteAuthReadOnlyWins(t *testing.T) {
+	t.Parallel()
+
+	h := newHarnessWithConfigure(t, func(s *api.Server) {
+		s.SetReadOnly(true)
+		s.SetAPITokens([]string{"0123456789abcdef-dashboards"})
+	})
+
+	resp, raw := h.do(t, http.MethodPost, "/api/contracts", "{}")
+	assert.Equal(t, http.StatusMethodNotAllowed, resp.StatusCode, string(raw))
+	assert.Contains(t, h.decode(t, raw)["error"], "read-only")
+}
+
+func TestContractDeprecationRequests(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.fake.Deploy(idA, moduleWith(t, "balance"))
+	resp, _ := h.do(t, http.MethodPost, "/api/contracts", `{"contract_id":"`+idA+`"}`)
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+
+	bad := []struct {
+		name string
+		body string
+		path string
+		want int
+	}{
+		{"successor is the contract itself", `{"successor":"` + idA + `"}`, idA, http.StatusBadRequest},
+		{"successor is not registered", `{"successor":"` + idB + `"}`, idA, http.StatusBadRequest},
+		{"unknown contract", `{}`, idB, http.StatusNotFound},
+		{"bad json", `{`, idA, http.StatusBadRequest},
+		{"unknown field", `{"why":"because"}`, idA, http.StatusBadRequest},
+	}
+	for _, tt := range bad {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			resp, raw := h.do(t, http.MethodPut, "/api/contracts/"+tt.path+"/deprecation", tt.body)
+			assert.Equal(t, tt.want, resp.StatusCode, string(raw))
+			assert.NotEmpty(t, h.decode(t, raw)["error"])
+		})
+	}
+
+	// A bare object retires the contract without a destination.
+	resp, raw := h.do(t, http.MethodPut, "/api/contracts/"+idA+"/deprecation", `{}`)
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+	got := h.decode(t, raw)
+	assert.NotEmpty(t, got["deprecated_since"])
+	assert.Empty(t, got["successor"])
+	assert.Empty(t, got["deprecation_note"])
 }
 
 // TestRegisterExistingContractReturns200 distinguishes creating a record
@@ -941,6 +1204,72 @@ func TestRealFixtureServesUsableABI(t *testing.T) {
 	assert.Contains(t, h.decode(t, raw)["signature"], "pub_signals: Vec<BytesN<32>>")
 }
 
+// TestDownloadContractABI proves the interface can be saved as a file rather
+// than displayed, under a name that says which contract and version it is.
+func TestDownloadContractABI(t *testing.T) {
+	t.Parallel()
+
+	old := moduleWith(t, "v1")
+	h := newHarness(t)
+	h.fake.Deploy(idA, old)
+	resp, raw := h.do(t, http.MethodPost, "/api/contracts", `{"contract_id":"`+idA+`"}`)
+	require.Equal(t, http.StatusCreated, resp.StatusCode, string(raw))
+
+	t.Run("without the parameter the interface is displayed", func(t *testing.T) {
+		resp, _ := h.do(t, http.MethodGet, "/api/contracts/"+idA, "")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Empty(t, resp.Header.Get("Content-Disposition"))
+	})
+
+	t.Run("the current interface is offered as a download", func(t *testing.T) {
+		resp, raw := h.do(t, http.MethodGet, "/api/contracts/"+idA+"?download=1", "")
+		require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+		assert.Contains(t, resp.Header.Get("Content-Type"), "application/json")
+
+		hash := h.decode(t, raw)["wasm_hash"].(string)
+		// The name is spelled out rather than built from the helper the
+		// handler uses: the .abi.json suffix is part of what the file is
+		// promised to be, and a test that reuses the implementation cannot
+		// notice it changing.
+		assert.Equal(t, idA+"."+hash[:12]+".abi.json",
+			attachmentName(t, resp.Header.Get("Content-Disposition")),
+			"the file must be named after the contract and the version it was decoded from")
+	})
+
+	t.Run("a superseded version is saved under its own hash", func(t *testing.T) {
+		h.fake.Upgrade(idA, moduleWith(t, "v2"))
+		resp, _ := h.do(t, http.MethodPost, "/api/contracts/"+idA+"/refresh", "")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		oldHash := stellartest.HashOf(old)
+		resp, _ = h.do(t, http.MethodGet, "/api/contracts/"+idA+"?wasm_hash="+oldHash+"&download=1", "")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, idA+"."+oldHash[:12]+".abi.json",
+			attachmentName(t, resp.Header.Get("Content-Disposition")),
+			"two versions of one contract must not be saved under the same name")
+	})
+
+	t.Run("a contract that is not there is not offered as a file", func(t *testing.T) {
+		resp, _ := h.do(t, http.MethodGet, "/api/contracts/"+idB+"?download=1", "")
+		require.Equal(t, http.StatusNotFound, resp.StatusCode)
+		assert.Empty(t, resp.Header.Get("Content-Disposition"),
+			"a failed request must not name a file to save")
+	})
+}
+
+// attachmentName pulls the file name out of a Content-Disposition header.
+func attachmentName(t *testing.T, header string) string {
+	t.Helper()
+
+	const prefix = `attachment; filename="`
+	require.True(t, strings.HasPrefix(header, prefix),
+		"the response must offer the document as a file, got %q", header)
+
+	name := strings.TrimSuffix(strings.TrimPrefix(header, prefix), `"`)
+	require.NotEmpty(t, name, "a download must be given a name")
+	return name
+}
+
 func TestTypeScriptClient(t *testing.T) {
 	t.Parallel()
 
@@ -961,9 +1290,41 @@ func TestTypeScriptClient(t *testing.T) {
 	assert.Contains(t, body, `export const contractId = "`+idA+`";`)
 	assert.Contains(t, body, `export const wasmHash = "`+stellartest.HashOf(module)+`";`)
 	assert.Contains(t, body, "has_voted(args: { nullifier: Buffer }")
+	assert.Contains(t, body, "export function assertSameWasm(liveHash: string): boolean {")
+	assert.Contains(t, body, "if (liveHash === wasmHash) return true;")
+
+	// An upgrade moves what the default client is generated from; the
+	// ?wasm_hash= client stays pinned to the superseded version, byte for
+	// byte, so a committed client can be regenerated to compare against.
+	old := stellartest.HashOf(module)
+	upgrade := moduleWith(t, "score")
+	h.fake.Deploy(idA, upgrade)
+	resp, raw = h.do(t, http.MethodPost, "/api/contracts", `{"contract_id":"`+idA+`"}`)
+	// The upgrade is a change to a known contract, not a new one.
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+
+	resp, raw = h.do(t, http.MethodGet, "/api/contracts/"+idA+"/client.ts?wasm_hash="+old, "")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+	assert.Contains(t, string(raw), `export const wasmHash = "`+old+`";`)
+	assert.Contains(t, string(raw), "has_voted(args: { nullifier: Buffer }")
+	assert.NotContains(t, string(raw), "score(args")
+
+	resp, raw = h.do(t, http.MethodGet, "/api/contracts/"+idA+"/client.ts", "")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+	assert.Contains(t, string(raw), `export const wasmHash = "`+stellartest.HashOf(upgrade)+`";`)
+	assert.Contains(t, string(raw), "score(args: { who: string }")
+	assert.NotContains(t, string(raw), "has_voted")
 
 	resp, _ = h.do(t, http.MethodGet, "/api/contracts/"+idA+"/client.ts?download=1", "")
 	assert.Equal(t, `attachment; filename="`+idA+`.client.ts"`, resp.Header.Get("Content-Disposition"))
+
+	resp, raw = h.do(t, http.MethodGet, "/api/contracts/"+idA+"/client.ts?zod=1", "")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+	zod := string(raw)
+	assert.Contains(t, zod, `import { z } from "zod";`)
+	assert.Contains(t, zod, "export const scoreArgsSchema = z.object({", "the schemas track the live interface")
+	assert.NotContains(t, zod, "ProposalSchema", "schemas follow what the interface holds now")
+	assert.NotContains(t, body, `import { z } from "zod";`, "the plain flavour stays zod-free")
 
 	resp, _ = h.do(t, http.MethodGet, "/api/contracts/"+idB+"/client.ts", "")
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
@@ -1229,4 +1590,85 @@ func TestUncacheableResponsesStayUncached(t *testing.T) {
 		assert.Empty(t, resp.Header.Get("ETag"), path)
 		assert.Empty(t, resp.Header.Get("Cache-Control"), path)
 	}
+}
+
+func TestRegisterStellarAssetContract(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.fake.DeploySAC(idA)
+
+	resp, raw := h.do(t, http.MethodPost, "/api/contracts", `{"contract_id":"`+idA+`"}`)
+	require.Equal(t, http.StatusCreated, resp.StatusCode, string(raw))
+	registered := h.decode(t, raw)
+	iface := registered["interface"].(map[string]any)
+	assert.Equal(t, true, iface["builtin"])
+	assert.Equal(t, "https://developers.stellar.org/docs/tokens/stellar-asset-contract", iface["source"])
+	assert.Len(t, iface["functions"].([]any), 17)
+
+	resp, raw = h.do(t, http.MethodGet, "/api/contracts/"+idA, "")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+	got := h.decode(t, raw)
+	assert.Equal(t, true, got["builtin"])
+	assert.Equal(t, "builtin:stellar-asset-contract:v1", got["interface_id"])
+	assert.NotContains(t, got, "wasm_hash")
+
+	resp, raw = h.do(t, http.MethodGet, "/api/contracts/"+idA+"/functions", "")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+	got = h.decode(t, raw)
+	assert.Equal(t, true, got["builtin"])
+	assert.Equal(t, "builtin:stellar-asset-contract:v1", got["interface_id"])
+	assert.NotContains(t, got, "wasm_hash")
+
+	resp, raw = h.do(t, http.MethodGet, "/api/contracts/"+idA+"/versions", "")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+	got = h.decode(t, raw)
+	versions := got["versions"].([]any)
+	require.Len(t, versions, 1)
+	version := versions[0].(map[string]any)
+	assert.Equal(t, true, version["builtin"])
+	assert.Equal(t, "builtin:stellar-asset-contract:v1", version["interface_id"])
+	assert.NotContains(t, version, "wasm_hash")
+
+	resp, raw = h.do(t, http.MethodGet, "/api/contracts/"+idA+"/client.ts", "")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+	assert.Contains(t, string(raw), `export const interfaceId = "builtin:stellar-asset-contract:v1";`)
+	assert.NotContains(t, string(raw), "export const wasmHash")
+}
+
+func TestListContractsFiltersByImplementedStandard(t *testing.T) {
+	h := newHarness(t)
+	defer h.server.Close()
+
+	functions := make([]model.Function, 0, len(spec.SEP41.Functions))
+	for _, required := range spec.SEP41.Functions {
+		inputs := make([]model.Param, 0, len(required.Inputs))
+		for i, typ := range required.Inputs {
+			inputs = append(inputs, model.Param{Name: string(rune('a' + i)), Type: typ})
+		}
+		functions = append(functions, model.Function{
+			Name: required.Name, Inputs: inputs, Outputs: append([]model.Type(nil), required.Outputs...),
+		})
+	}
+	tokenInterface := &model.Interface{ABIVersion: model.ABIVersion, Functions: functions}
+	plainInterface := &model.Interface{ABIVersion: model.ABIVersion, Functions: []model.Function{
+		{Name: "transfer", Inputs: []model.Param{{Name: "amount", Type: model.Scalar(model.KindU32)}}},
+	}}
+
+	ctx := context.Background()
+	require.NoError(t, h.store.Save(ctx, store.Contract{ContractID: idA, Network: "testnet", CurrentWasmHash: "token-hash"}, tokenInterface))
+	require.NoError(t, h.store.Save(ctx, store.Contract{ContractID: idB, Network: "testnet", CurrentWasmHash: "plain-hash"}, plainInterface))
+
+	resp, raw := h.do(t, http.MethodGet, "/api/contracts?network=testnet&implements=sep41", "")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+
+	var body struct {
+		Contracts []store.Contract `json:"contracts"`
+		Total     int              `json:"total"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &body))
+	require.Equal(t, 1, body.Total)
+	require.Len(t, body.Contracts, 1)
+	assert.Equal(t, idA, body.Contracts[0].ContractID)
+	assert.Equal(t, []string{"sep41"}, body.Contracts[0].Implements)
 }

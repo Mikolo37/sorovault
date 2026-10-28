@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/soroworks/sorovault/internal/model"
+	"github.com/soroworks/sorovault/internal/spec"
 )
 
 // Memory is an in-process Store.
@@ -23,6 +24,8 @@ type Memory struct {
 	contracts map[string]Contract
 	specs     map[string][]Spec
 	wasmSpecs map[string]WasmSpec
+	state     map[string]string
+	subs      map[string]Subscription
 	nextID    int64
 
 	// now is the clock, swappable so tests can produce deterministic and
@@ -38,6 +41,8 @@ func NewMemory() *Memory {
 		contracts: make(map[string]Contract),
 		specs:     make(map[string][]Spec),
 		wasmSpecs: make(map[string]WasmSpec),
+		state:     make(map[string]string),
+		subs:      make(map[string]Subscription),
 		now:       time.Now,
 	}
 }
@@ -50,8 +55,117 @@ func (m *Memory) SetClock(now func() time.Time) {
 	m.now = now
 }
 
+// Ping satisfies Store. The memory store has no external service to ask.
+func (m *Memory) Ping(ctx context.Context) error { return ctx.Err() }
+
 // Close satisfies Store. There is nothing to release.
 func (m *Memory) Close() error { return nil }
+
+// Subscribe creates a new webhook subscription for the given network and
+// contract IDs. Returns the subscription ID (which also serves as the
+// secret for HMAC signing and deletion).
+func (m *Memory) Subscribe(ctx context.Context, network string, contractIDs []string, url string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	id, err := newSubscriptionSecret()
+	if err != nil {
+		return "", err
+	}
+	k := id
+	sub := Subscription{
+		ID:          id,
+		Network:     network,
+		ContractIDs: contractIDs,
+		URL:         url,
+		Active:      true,
+		CreatedAt:   m.now(),
+	}
+	m.subs[k] = sub
+	return id, nil
+}
+
+// ListSubscriptions returns all subscriptions, active and inactive.
+func (m *Memory) ListSubscriptions(ctx context.Context) ([]SubscriptionListItem, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	items := make([]SubscriptionListItem, 0, len(m.subs))
+	for _, sub := range m.subs {
+		items = append(items, SubscriptionListItem{
+			ID:        sub.ID,
+			Network:   sub.Network,
+			Contracts: len(sub.ContractIDs),
+			Active:    sub.Active,
+			CreatedAt: sub.CreatedAt.UTC().Format(time.RFC3339),
+		})
+	}
+	// Sort by created_at descending
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].CreatedAt > items[j].CreatedAt
+	})
+	return items, nil
+}
+
+// GetSubscription returns a subscription by its secret (ID).
+func (m *Memory) GetSubscription(ctx context.Context, secret string) (*Subscription, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	k := secret
+	sub, ok := m.subs[k]
+	if !ok {
+		return nil, fmt.Errorf("%w: subscription not found", ErrNotFound)
+	}
+	// Return a clone so the caller can mutate it safely.
+	out := sub
+	out.ContractIDs = make([]string, len(sub.ContractIDs))
+	copy(out.ContractIDs, sub.ContractIDs)
+	return &out, nil
+}
+
+// MarkSubscriptionInactive marks a subscription as inactive.
+func (m *Memory) MarkSubscriptionInactive(ctx context.Context, secret string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	k := secret
+	sub, ok := m.subs[k]
+	if !ok {
+		return fmt.Errorf("%w: subscription not found", ErrNotFound)
+	}
+	sub.Active = false
+	m.subs[k] = sub
+	return nil
+}
+
+// Unsubscribe removes a subscription by its secret (ID).
+func (m *Memory) Unsubscribe(ctx context.Context, secret string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	k := secret
+	if _, ok := m.subs[k]; !ok {
+		return fmt.Errorf("%w: subscription not found", ErrNotFound)
+	}
+	delete(m.subs, k)
+	return nil
+}
 
 func key(network, contractID string) string { return network + "\x00" + contractID }
 
@@ -132,12 +246,26 @@ func (m *Memory) Save(ctx context.Context, c Contract, iface *model.Interface) e
 		if c.SourceCommit == "" {
 			c.SourceCommit = existing.SourceCommit
 		}
+		// Saving an interface says nothing about who made the contract or
+		// who vouched for it, so both survive.
+		if c.Creator == "" {
+			c.Creator, c.CreatedLedger = existing.Creator, existing.CreatedLedger
+		}
+		c.VerifiedBy, c.VerifiedWasmHash = existing.VerifiedBy, existing.VerifiedWasmHash
+		c.VerifiedAt = copyMissing(existing.VerifiedAt)
+		// A refresh does not revisit the deprecation mark: being live on
+		// the network again says nothing about being the recommended
+		// contract to use.
+		c.DeprecatedSince = existing.DeprecatedSince
+		c.Successor = existing.Successor
+		c.DeprecationNote = existing.DeprecationNote
 	} else {
 		c.FirstSeen = now
 	}
 	c.LastRefreshed = now
 	// A saved interface means the contract was live, so it is not missing
 	// any more.
+	c.Implements = spec.ImplementedStandards(iface)
 	c.MissingSince = nil
 	m.contracts[k] = c
 
@@ -150,12 +278,13 @@ func (m *Memory) Save(ctx context.Context, c Contract, iface *model.Interface) e
 
 	m.nextID++
 	m.specs[k] = append(m.specs[k], Spec{
-		ID:         m.nextID,
-		Network:    c.Network,
-		ContractID: c.ContractID,
-		WasmHash:   c.CurrentWasmHash,
-		Interface:  cloned,
-		DecodedAt:  now,
+		ID:             m.nextID,
+		Network:        c.Network,
+		ContractID:     c.ContractID,
+		WasmHash:       c.CurrentWasmHash,
+		Interface:      cloned,
+		DecodedAt:      now,
+		ObservedLedger: c.ObservedLedger,
 	})
 	return nil
 }
@@ -183,6 +312,47 @@ func (m *Memory) MarkMissing(ctx context.Context, network, contractID string, si
 	return nil
 }
 
+// SetDeprecation marks an existing contract deprecated, with an optional
+// successor contract ID and note. Verifying a successor — registered on
+// the same network, and a different contract — is the caller's job.
+func (m *Memory) SetDeprecation(ctx context.Context, network, contractID, successor, note string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := key(network, contractID)
+	c, ok := m.contracts[k]
+	if !ok {
+		return fmt.Errorf("%w: contract %s on %s", ErrNotFound, contractID, network)
+	}
+	now := m.now()
+	c.DeprecatedSince = &now
+	c.Successor = successor
+	c.DeprecationNote = note
+	m.contracts[k] = c
+	return nil
+}
+
+// ClearDeprecation lifts the mark, restoring the contract to active use.
+func (m *Memory) ClearDeprecation(ctx context.Context, network, contractID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := key(network, contractID)
+	c, ok := m.contracts[k]
+	if !ok {
+		return fmt.Errorf("%w: contract %s on %s", ErrNotFound, contractID, network)
+	}
+	c.DeprecatedSince = nil
+	c.Successor = ""
+	c.DeprecationNote = ""
+	m.contracts[k] = c
+	return nil
+}
+
 // UpdateSource attaches repository metadata to an existing contract.
 func (m *Memory) UpdateSource(ctx context.Context, network, contractID, sourceURL, sourceCommit string) error {
 	if err := ctx.Err(); err != nil {
@@ -198,6 +368,67 @@ func (m *Memory) UpdateSource(ctx context.Context, network, contractID, sourceUR
 	c.SourceURL = sourceURL
 	c.SourceCommit = sourceCommit
 	m.contracts[k] = c
+	return nil
+}
+
+// SetOrigin records who created a contract and in which ledger.
+func (m *Memory) SetOrigin(ctx context.Context, network, contractID, creator string, ledger uint32) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := key(network, contractID)
+	c, ok := m.contracts[k]
+	if !ok {
+		return fmt.Errorf("%w: contract %s on %s", ErrNotFound, contractID, network)
+	}
+	c.Creator, c.CreatedLedger = creator, ledger
+	m.contracts[k] = c
+	return nil
+}
+
+// SetVerified records an accepted publisher claim.
+func (m *Memory) SetVerified(ctx context.Context, network, contractID, name, sourceURL, sourceCommit string, v Verification) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := key(network, contractID)
+	c, ok := m.contracts[k]
+	if !ok {
+		return fmt.Errorf("%w: contract %s on %s", ErrNotFound, contractID, network)
+	}
+	at := v.VerifiedAt.UTC()
+	c.Name, c.SourceURL, c.SourceCommit = name, sourceURL, sourceCommit
+	c.VerifiedBy, c.VerifiedAt, c.VerifiedWasmHash = v.Publisher, &at, v.WasmHash
+	m.contracts[k] = c
+	return nil
+}
+
+// GetState returns a persisted value.
+func (m *Memory) GetState(ctx context.Context, key string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	value, ok := m.state[key]
+	if !ok {
+		return "", fmt.Errorf("%w: state %q", ErrNotFound, key)
+	}
+	return value, nil
+}
+
+// SetState stores a value under key.
+func (m *Memory) SetState(ctx context.Context, key, value string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.state[key] = value
 	return nil
 }
 
@@ -234,6 +465,7 @@ func (m *Memory) Export(ctx context.Context) (*Snapshot, error) {
 	for k, c := range m.contracts {
 		cs := ContractSnapshot{Contract: c}
 		cs.Contract.MissingSince = copyMissing(c.MissingSince)
+		cs.Contract.VerifiedAt = copyMissing(c.VerifiedAt)
 		cs.Contract.Matches = nil
 		for _, spec := range m.specs[k] {
 			cloned, err := cloneInterface(spec.Interface)
@@ -276,6 +508,7 @@ func (m *Memory) Import(ctx context.Context, snapshot *Snapshot, merge bool) err
 	prepared := make([]ContractSnapshot, 0, len(snapshot.Contracts))
 	for _, cs := range snapshot.Contracts {
 		cs.Contract.MissingSince = copyMissing(cs.Contract.MissingSince)
+		cs.Contract.VerifiedAt = copyMissing(cs.Contract.VerifiedAt)
 		cs.Contract.Matches = nil
 		for i := range cs.Versions {
 			cloned, err := cloneInterface(cs.Versions[i].Interface)
@@ -366,6 +599,7 @@ func (m *Memory) GetContract(ctx context.Context, network, contractID string) (*
 		return nil, fmt.Errorf("%w: contract %s on %s", ErrNotFound, contractID, network)
 	}
 	c.MissingSince = copyMissing(c.MissingSince)
+	c.VerifiedAt = copyMissing(c.VerifiedAt)
 	return &c, nil
 }
 
@@ -425,6 +659,7 @@ func (m *Memory) Stats(ctx context.Context) (*Stats, error) {
 		if stats.Latest == nil || newerContract(c, *stats.Latest) {
 			latest := c
 			latest.MissingSince = copyMissing(c.MissingSince)
+			latest.VerifiedAt = copyMissing(c.VerifiedAt)
 			stats.Latest = &latest
 		}
 	}
@@ -504,46 +739,109 @@ func (m *Memory) ListContracts(ctx context.Context, f ListFilter) (*ContractPage
 		return nil, err
 	}
 	f.Normalize()
+	if f.Cursor != "" && f.Offset != 0 {
+		return nil, errors.New("store: a cursor and an offset are exclusive")
+	}
+	var cur listCursor
+	if f.Cursor != "" {
+		var err error
+		cur, err = decodeListCursor(f.Cursor)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	matched := make([]Contract, 0, len(m.contracts))
+	// docRows are the matches with their search rank: a name hit sorts in
+	// front of a doc-only hit when the listing was filtered by a query,
+	// and the cursor that pages the result has to carry the same rank.
+	// Rank rides with the row so the sort cannot de-sync them.
+	type docRow struct {
+		contract Contract
+		rank     int
+	}
+	rows := make([]docRow, 0, len(m.contracts))
 	needle := strings.ToLower(f.Query)
 	for k, c := range m.contracts {
 		if f.Network != "" && c.Network != f.Network {
 			continue
 		}
-		if needle != "" {
-			c.Matches = matchSymbols(m.currentSymbols(k, c.CurrentWasmHash), f.Query)
-			if len(c.Matches) == 0 &&
-				!strings.Contains(strings.ToLower(c.ContractID), needle) &&
-				!strings.Contains(strings.ToLower(c.Name), needle) {
-				continue
-			}
+		if len(f.Implements) > 0 && !hasAllStandards(c.Implements, f.Implements) {
+			continue
 		}
 		if len(f.Functions) > 0 || len(f.Types) > 0 {
 			if !hasAll(m.currentInterface(k, c.CurrentWasmHash), f.Functions, f.Types) {
 				continue
 			}
 		}
+		// An unqueried listing has no rank: it sorts on refresh time alone
+		// and every cursor it mints sits at the name tier.
+		rank := 0
+		if needle != "" {
+			c.Matches = matchSymbols(m.currentSymbols(k, c.CurrentWasmHash), f.Query)
+			nameHit := len(c.Matches) > 0 ||
+				strings.Contains(strings.ToLower(c.ContractID), needle) ||
+				strings.Contains(strings.ToLower(c.Name), needle)
+			if !nameHit && !matchDocs(m.currentDocs(k, c.CurrentWasmHash), f.Query) {
+				continue
+			}
+			rank = docRank(nameHit)
+		}
 		c.MissingSince = copyMissing(c.MissingSince)
-		matched = append(matched, c)
+		c.VerifiedAt = copyMissing(c.VerifiedAt)
+		rows = append(rows, docRow{contract: c, rank: rank})
 	}
 
-	sort.Slice(matched, func(i, j int) bool {
-		if !matched[i].LastRefreshed.Equal(matched[j].LastRefreshed) {
-			return matched[i].LastRefreshed.After(matched[j].LastRefreshed)
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].rank != rows[j].rank {
+			return rows[i].rank < rows[j].rank
 		}
-		return matched[i].ContractID < matched[j].ContractID
+		return contractListBefore(rows[i].contract, rows[j].contract)
 	})
 
-	page := &ContractPage{Total: len(matched), Contracts: []Contract{}}
-	if f.Offset < len(matched) {
-		end := min(f.Offset+f.Limit, len(matched))
-		page.Contracts = append(page.Contracts, matched[f.Offset:end]...)
+	// A cursor pages by key: the next page starts at the first row that
+	// sorts strictly after the one the cursor names. The slice is already
+	// in listing order, so that is one binary search, not a scan.
+	start := 0
+	if cur.ContractID != "" {
+		start = sort.Search(len(rows), func(i int) bool {
+			return afterListCursor(rows[i].contract, rows[i].rank, cur)
+		})
+	} else {
+		start = f.Offset
+	}
+
+	page := &ContractPage{Total: len(rows), Contracts: []Contract{}}
+	if start < len(rows) {
+		end := min(start+f.Limit, len(rows))
+		for _, r := range rows[start:end] {
+			page.Contracts = append(page.Contracts, r.contract)
+		}
+		if end < len(rows) {
+			next, err := encodeListCursor(rows[end-1].contract, rows[end-1].rank)
+			if err != nil {
+				return nil, err
+			}
+			page.Next = next
+		}
 	}
 	return page, nil
+}
+
+// contractListBefore is the listing's total order: last_refreshed
+// descending, then contract ID and network ascending. Sorting and cursor
+// paging share it, so a cursor walk and the order its pages arrive in are
+// the same thing rather than two conventions that agree by luck.
+func contractListBefore(a, b Contract) bool {
+	if !a.LastRefreshed.Equal(b.LastRefreshed) {
+		return a.LastRefreshed.After(b.LastRefreshed)
+	}
+	if a.ContractID != b.ContractID {
+		return a.ContractID < b.ContractID
+	}
+	return a.Network < b.Network
 }
 
 // ListContractsByWasm returns a paged listing of the contracts that run the
@@ -570,6 +868,7 @@ func (m *Memory) ListContractsByWasm(ctx context.Context, f WasmFilter) (*WasmCo
 			}
 		}
 		c.MissingSince = copyMissing(c.MissingSince)
+		c.VerifiedAt = copyMissing(c.VerifiedAt)
 		matched = append(matched, WasmContract{Contract: c, Current: current})
 	}
 
@@ -607,6 +906,17 @@ func (m *Memory) currentSymbols(k, wasmHash string) string {
 	for _, s := range m.specs[k] {
 		if s.WasmHash == wasmHash {
 			return joinSymbols(s.Interface)
+		}
+	}
+	return ""
+}
+
+// currentDocs returns the joined doc comments of the spec a contract
+// currently runs. The caller holds m.mu.
+func (m *Memory) currentDocs(k, wasmHash string) string {
+	for _, s := range m.specs[k] {
+		if s.WasmHash == wasmHash {
+			return joinDocs(s.Interface)
 		}
 	}
 	return ""
@@ -675,11 +985,14 @@ func (m *Memory) ListVersions(ctx context.Context, network, contractID string) (
 
 	versions := make([]SpecVersion, 0, len(m.specs[k]))
 	for _, s := range m.specs[k] {
-		versions = append(versions, SpecVersion{
-			WasmHash:  s.WasmHash,
-			DecodedAt: s.DecodedAt,
-			Current:   s.WasmHash == c.CurrentWasmHash,
-		})
+		v := SpecVersion{DecodedAt: s.DecodedAt, Current: s.WasmHash == c.CurrentWasmHash, ObservedLedger: s.ObservedLedger}
+		if s.WasmHash == model.StellarAssetContractIdentifier {
+			v.InterfaceID = s.WasmHash
+			v.Builtin = true
+		} else {
+			v.WasmHash = s.WasmHash
+		}
+		versions = append(versions, v)
 	}
 
 	sort.Slice(versions, func(i, j int) bool {

@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/soroworks/sorovault/internal/api"
 	"github.com/soroworks/sorovault/internal/model"
 	"github.com/soroworks/sorovault/internal/registry"
 	"github.com/soroworks/sorovault/internal/spec"
@@ -48,6 +49,46 @@ func newHarness(t *testing.T) *harness {
 
 	ui, err := web.NewServer(reg, log)
 	require.NoError(t, err)
+
+	r := chi.NewRouter()
+	r.Mount("/", ui.Routes())
+
+	srv := httptest.NewServer(r)
+	t.Cleanup(srv.Close)
+
+	return &harness{server: srv, fake: fake, reg: reg, store: memory}
+}
+
+// newReadOnlyHarness is newHarness with the UI's read-only mode on, set
+// before the routes mount, the way serve wires READ_ONLY.
+func newReadOnlyHarness(t *testing.T) *harness {
+	t.Helper()
+
+	return newHarnessWithConfigure(t, func(ui *web.Server) { ui.SetReadOnly(true) })
+}
+
+// newWriteAuthRequiredHarness is newHarness with the UI's token-required
+// mode on, set before the routes mount, the way serve wires API_TOKENS.
+func newWriteAuthRequiredHarness(t *testing.T) *harness {
+	t.Helper()
+
+	return newHarnessWithConfigure(t, func(ui *web.Server) { ui.SetWriteAuthRequired(true) })
+}
+
+// newHarnessWithConfigure builds the default harness with a tweak applied
+// to the UI server before its routes mount.
+func newHarnessWithConfigure(t *testing.T, configure func(*web.Server)) *harness {
+	t.Helper()
+
+	fake := stellartest.New()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	memory := store.NewMemory()
+	memory.SetClock(func() time.Time { return time.Unix(0, 0) })
+	reg := registry.New(fake, spec.XDRDecoder{}, memory, registry.Options{Logger: log})
+
+	ui, err := web.NewServer(reg, log)
+	require.NoError(t, err)
+	configure(ui)
 
 	r := chi.NewRouter()
 	r.Mount("/", ui.Routes())
@@ -150,6 +191,46 @@ func TestIndexEmpty(t *testing.T) {
 	assert.Contains(t, resp.Header.Get("Content-Type"), "text/html")
 	assert.Contains(t, body, "No contracts registered yet")
 	assert.Contains(t, body, "sorovault add")
+}
+
+// TestReadOnlyHidesTheRegisterForm proves a read-only mirror offers no
+// registration surface: the form is gone from the index, and a form POST
+// aimed at the missing endpoint is told the method is refused rather than
+// sent a 404 that reads as an unknown resource.
+func TestReadOnlyHidesTheRegisterForm(t *testing.T) {
+	t.Parallel()
+
+	h := newReadOnlyHarness(t)
+
+	resp, body := h.get(t, "/")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Contains(t, body, "No contracts registered yet",
+		"reads keep working in read-only mode")
+	assert.NotContains(t, body, "Register a contract")
+	assert.NotContains(t, body, `name="contract_id"`)
+
+	resp, body = h.postForm(t, "/contracts", url.Values{"contract_id": {idA}}, nil)
+	assert.Equal(t, http.StatusMethodNotAllowed, resp.StatusCode)
+	assert.Contains(t, body, "read-only")
+}
+
+// TestWriteAuthHidesTheRegisterForm proves a token-gated registry offers
+// no working browser form: a plain HTML form cannot carry the secret a
+// write would need, so the form goes away and the POST route explains
+// what the form would have demanded.
+func TestWriteAuthHidesTheRegisterForm(t *testing.T) {
+	t.Parallel()
+
+	h := newWriteAuthRequiredHarness(t)
+
+	resp, body := h.get(t, "/")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.NotContains(t, body, `name="contract_id"`)
+	assert.Contains(t, body, "API token")
+
+	resp, body = h.postForm(t, "/contracts", url.Values{"contract_id": {idA}}, nil)
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	assert.Contains(t, body, "API token")
 }
 
 // TestIndexListsContracts proves a contract that has gone missing is
@@ -330,6 +411,33 @@ func TestContractPage(t *testing.T) {
 	assert.Contains(t, body, "0123456789abcdef0123456789abcdef01234567")
 	assert.Contains(t, body, "current")
 	assert.Contains(t, body, "/api/contracts/"+idA+"/client.ts?", "the typed client should be linked")
+}
+
+// TestContractPageOffersTheABIDownload proves the page links to the
+// interface as a file, and not only to the document the browser renders.
+func TestContractPageOffersTheABIDownload(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.register(t, idA)
+
+	const hash = "c618dae264864ccf446a3c7db27da80c7c83e840131242cc2fe9cd32a2a20781"
+
+	resp, body := h.get(t, "/contracts/"+idA)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	assert.Contains(t, body,
+		`href="/api/contracts/`+idA+`?network=testnet&amp;wasm_hash=`+hash+`&amp;download=1"`,
+		"the page should link to the interface as a download")
+
+	// The name is spelled out here rather than built from the API's own
+	// helper: the .abi.json suffix is what the file is promised to be, and
+	// a test that reuses the implementation cannot notice it changing.
+	const want = idA + ".c618dae26486.abi.json"
+	assert.Equal(t, want, api.ABIFilename(idA, hash),
+		"a downloaded interface must be named <contract>.<short-hash>.abi.json")
+	assert.Contains(t, body, want,
+		"the link should say what the downloaded file will be called")
 }
 
 // TestContractPageEscapesOutput guards against a contract's own strings
@@ -706,4 +814,52 @@ func TestHtmxInjectsNoInlineStyle(t *testing.T) {
 	_, body := h.get(t, "/")
 	assert.Contains(t, body, `name="htmx-config"`)
 	assert.Contains(t, body, "includeIndicatorStyles")
+}
+
+func TestContractPageShowsDeployerAndVerification(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	h := newHarness(t)
+	h.register(t, idA)
+
+	t.Run("an unknown deployer is labelled unknown", func(t *testing.T) {
+		_, body := h.get(t, "/contracts/"+idA)
+		assert.Contains(t, body, "<dt>Deployer</dt>")
+		assert.Contains(t, body, `<dd class="dim"`)
+		assert.Contains(t, body, ">Unknown</dd>")
+		assert.NotContains(t, body, "Verified")
+	})
+
+	require.NoError(t, h.store.SetOrigin(ctx, "testnet", idA, "GCREATOR", 4242))
+
+	t.Run("a known deployer is shown with its ledger", func(t *testing.T) {
+		_, body := h.get(t, "/contracts/"+idA)
+		assert.Contains(t, body, "GCREATOR")
+		assert.Contains(t, body, "in ledger 4242")
+		assert.NotContains(t, body, ">Unknown</dd>")
+		assert.NotContains(t, body, "<dt>Publisher</dt>")
+	})
+
+	current, err := h.store.GetContract(ctx, "testnet", idA)
+	require.NoError(t, err)
+	require.NoError(t, h.store.SetVerified(ctx, "testnet", idA, "Voting", "https://github.com/example/vote", "",
+		store.Verification{Publisher: "GCREATOR", VerifiedAt: time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC), WasmHash: current.CurrentWasmHash}))
+
+	t.Run("a verified publisher is badged on the page and in the list", func(t *testing.T) {
+		_, body := h.get(t, "/contracts/"+idA)
+		assert.Contains(t, body, `<span class="badge verified"`)
+		assert.Contains(t, body, "2026-08-07")
+		assert.NotContains(t, body, "for an earlier version")
+
+		_, list := h.get(t, "/")
+		assert.Contains(t, list, `<span class="badge verified"`)
+	})
+
+	t.Run("a verification for an older version says so", func(t *testing.T) {
+		require.NoError(t, h.store.SetVerified(ctx, "testnet", idA, "Voting", "https://github.com/example/vote", "",
+			store.Verification{Publisher: "GCREATOR", VerifiedAt: time.Now(), WasmHash: "0ld"}))
+		_, body := h.get(t, "/contracts/"+idA)
+		assert.Contains(t, body, "for an earlier version")
+	})
 }

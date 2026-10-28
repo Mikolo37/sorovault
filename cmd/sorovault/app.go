@@ -19,13 +19,16 @@ type app struct {
 	cfg      *config.Config
 	log      *slog.Logger
 	registry *registry.Registry
+	fetcher  stellar.Fetcher
 
 	closers []func() error
 }
 
 // newApp loads configuration and connects the registry to Postgres and RPC.
+// The configuration source is whatever --config named (or CONFIG_PATH),
+// layered under the environment.
 func newApp(ctx context.Context) (*app, error) {
-	cfg, err := config.Load()
+	cfg, err := config.LoadWith(configPath)
 	if err != nil {
 		return nil, err
 	}
@@ -33,10 +36,19 @@ func newApp(ctx context.Context) (*app, error) {
 	log := cfg.NewLogger(os.Stderr)
 	slog.SetDefault(log)
 
-	db, err := store.NewPostgres(ctx, cfg.DatabaseURL)
+	db, err := store.NewPostgres(ctx, cfg.DatabaseURL, store.PoolOptions{
+		MaxConns: cfg.DatabaseMaxConns,
+		MinConns: cfg.DatabaseMinConns,
+	})
 	if err != nil {
 		return nil, err
 	}
+
+	// The pool in force is not always the one that was configured: pgx has
+	// defaults of its own, and the connection string can carry a size too.
+	// Logging the resolved numbers says which the process actually got.
+	pool := db.PoolConfig()
+	log.Info("database pool ready", "max_conns", pool.MaxConns, "min_conns", pool.MinConns)
 
 	fetcher := stellar.NewRPCFetcher(cfg.RPCURL, nil)
 
@@ -50,6 +62,7 @@ func newApp(ctx context.Context) (*app, error) {
 		cfg:      cfg,
 		log:      log,
 		registry: reg,
+		fetcher:  fetcher,
 		closers:  []func() error{fetcher.Close, db.Close},
 	}, nil
 }
@@ -89,12 +102,15 @@ func (a *app) fetchContext(ctx context.Context) (context.Context, context.Cancel
 // registry data between stores use it so they cannot accidentally depend on
 // RPC: export and import must work during an outage.
 func withStore(ctx context.Context, fn func(context.Context, store.Store) error) error {
-	cfg, err := config.Load()
+	cfg, err := config.LoadWith(configPath)
 	if err != nil {
 		return err
 	}
 
-	db, err := store.NewPostgres(ctx, cfg.DatabaseURL)
+	db, err := store.NewPostgres(ctx, cfg.DatabaseURL, store.PoolOptions{
+		MaxConns: cfg.DatabaseMaxConns,
+		MinConns: cfg.DatabaseMinConns,
+	})
 	if err != nil {
 		return err
 	}
@@ -103,10 +119,12 @@ func withStore(ctx context.Context, fn func(context.Context, store.Store) error)
 	return fn(ctx, db)
 }
 
-// requireDatabaseURL produces the same guidance as config.Load for commands
-// that need only the database and skip the rest of the wiring.
+// requireDatabaseURL produces the same guidance as it always has for
+// commands that need only the database and skip the rest of the wiring —
+// the wording callers pin on — while honoring the config file the way
+// every command now does.
 func requireDatabaseURL() (string, error) {
-	url, err := config.DatabaseURLFromEnv()
+	url, err := config.DatabaseURL(configPath)
 	if err != nil {
 		return "", err
 	}
